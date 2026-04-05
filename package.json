@@ -1,0 +1,25 @@
+{
+  "name": "github-claude-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub issue worker that uses Claude Code to implement features, push branches, and open PRs.",
+  "main": "dist/worker.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/worker.js",
+    "dev": "tsx worker.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@octokit/rest": "^22.0.0",
+    "dotenv": "^17.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
