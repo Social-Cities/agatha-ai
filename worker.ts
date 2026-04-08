@@ -10,6 +10,14 @@ type IssueLike = {
   body: string | null;
 };
 
+type PRComment = {
+  id: number;
+  prNumber: number;
+  prTitle: string;
+  prBranch: string;
+  body: string;
+};
+
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
 });
@@ -121,6 +129,51 @@ function safeBranchName(issueNumber: number): string {
 
 function sanitizeCommitMessage(input: string): string {
   return input.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+function buildFeedbackPrompt(
+  prTitle: string,
+  feedbackBody: string
+): string {
+  return `
+You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+
+You previously opened a PR with the following title:
+${prTitle}
+
+A reviewer has left the following feedback on your PR:
+
+---
+${feedbackBody}
+---
+
+Rules:
+- Follow existing repository patterns and conventions.
+- Make the minimum set of changes necessary to address the feedback.
+- Do not refactor unrelated code.
+- Preserve type safety.
+- Run the relevant validation commands before finishing.
+- If tests exist for the touched area, update or add them.
+- Do not create a pull request.
+- Do not push to git.
+- Do not change git remotes.
+- At the end, stop after code and local validation are complete.
+
+Before editing:
+1. Inspect the codebase and the current diff to understand the existing changes.
+2. Make a short plan for addressing the feedback.
+3. Then implement.
+
+Before finishing:
+- Run build, typecheck, and tests as appropriate for this repo.
+- Write a file called ".ai-summary.md" at the repo root with the following sections:
+  ## Feedback Addressed
+  A summary of the reviewer feedback and how you addressed it.
+  ## Changes
+  A file-by-file breakdown of what was changed and why.
+  ## Risks & Notes
+  Any risks, edge cases, or things the reviewer should pay attention to.
+`.trim();
 }
 
 function buildClaudePrompt(issueTitle: string, issueBody: string): string {
@@ -368,6 +421,141 @@ async function processIssue(issue: IssueLike): Promise<void> {
   }
 }
 
+const COMMENT_PREFIX = "/agatha";
+const processedCommentIds = new Set<number>();
+
+async function reactToComment(commentId: number, reaction: "+1" | "eyes" | "rocket"): Promise<void> {
+  await octokit.reactions.createForIssueComment({
+    owner: OWNER!,
+    repo: REPO!,
+    comment_id: commentId,
+    content: reaction,
+  });
+}
+
+async function getPendingPRComments(): Promise<PRComment[]> {
+  const pulls = await octokit.pulls.list({
+    owner: OWNER!,
+    repo: REPO!,
+    state: "open",
+    per_page: 50,
+  });
+
+  const pending: PRComment[] = [];
+
+  for (const pr of pulls.data) {
+    const comments = await octokit.issues.listComments({
+      owner: OWNER!,
+      repo: REPO!,
+      issue_number: pr.number,
+      per_page: 100,
+    });
+
+    for (const c of comments.data) {
+      if (
+        c.body &&
+        c.body.trimStart().startsWith(COMMENT_PREFIX) &&
+        !processedCommentIds.has(c.id)
+      ) {
+        pending.push({
+          id: c.id,
+          prNumber: pr.number,
+          prTitle: pr.title,
+          prBranch: pr.head.ref,
+          body: c.body.trimStart().slice(COMMENT_PREFIX.length).trim(),
+        });
+      }
+    }
+  }
+
+  return pending;
+}
+
+async function processPRComment(prComment: PRComment): Promise<void> {
+  const { id, prNumber, prTitle, prBranch, body } = prComment;
+  processedCommentIds.add(id);
+
+  await reactToComment(id, "eyes");
+  await comment(prNumber, `🤖 Working on your feedback…\n\n> ${body.split("\n")[0]}`);
+
+  const prompt = buildFeedbackPrompt(prTitle, body);
+
+  try {
+    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
+    await runCommand("git", ["checkout", prBranch], REPO_PATH!);
+    await runCommand("git", ["pull", "origin", prBranch], REPO_PATH!);
+    await runCommand("git", ["reset", "--hard", `origin/${prBranch}`], REPO_PATH!);
+    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
+
+    await runClaude(prompt, REPO_PATH!);
+
+    const diffCheck = await runCommand("git", ["status", "--porcelain"], REPO_PATH!);
+    if (!diffCheck.stdout.trim()) {
+      await comment(prNumber, `⚠️ I reviewed the feedback but found no code changes were needed.`);
+      return;
+    }
+
+    // Read the AI summary if it was generated
+    const summaryPath = path.join(REPO_PATH!, ".ai-summary.md");
+    let aiSummary = "";
+    try {
+      aiSummary = fs.readFileSync(summaryPath, "utf8");
+    } catch {
+      // Summary wasn't created
+    }
+
+    // Remove the summary file before committing
+    try {
+      fs.unlinkSync(summaryPath);
+    } catch {
+      // Ignore
+    }
+
+    // Get diff stats
+    const diffStat = await runCommand(
+      "git",
+      ["diff", "--stat", `origin/${prBranch}`],
+      REPO_PATH!
+    );
+
+    await runCommand("git", ["add", "."], REPO_PATH!);
+    await runCommand(
+      "git",
+      ["commit", "-m", `AI: address feedback on #${prNumber}`],
+      REPO_PATH!
+    );
+    await runCommand("git", ["push", "origin", prBranch], REPO_PATH!);
+
+    const responseBody = [
+      `✅ I've pushed changes to address your feedback.`,
+      "",
+      aiSummary || "_No detailed summary was generated. Review the diff below._",
+      "",
+      "## 📊 Diff Summary",
+      "",
+      "```",
+      diffStat.stdout.trim(),
+      "```",
+    ].join("\n");
+
+    await comment(prNumber, responseBody);
+    await reactToComment(id, "rocket");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      prNumber,
+      `❌ Failed while addressing feedback.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+  } finally {
+    const summaryPath = path.join(REPO_PATH!, ".ai-summary.md");
+    try {
+      fs.unlinkSync(summaryPath);
+    } catch {
+      // Ignore cleanup failure.
+    }
+  }
+}
+
 let running = false;
 
 async function poll(): Promise<void> {
@@ -375,6 +563,14 @@ async function poll(): Promise<void> {
   running = true;
 
   try {
+    // Check for PR feedback comments first
+    const pendingComments = await getPendingPRComments();
+    if (pendingComments.length > 0) {
+      await processPRComment(pendingComments[0]);
+      return;
+    }
+
+    // Then check for new issues
     const issues = await octokit.issues.listForRepo({
       owner: OWNER!,
       repo: REPO!,
@@ -394,7 +590,7 @@ async function poll(): Promise<void> {
       await processIssue({
         number: issue.number,
         title: issue.title,
-        body: issue.body,
+        body: issue.body ?? null,
       });
 
       // Process one job at a time.
