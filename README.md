@@ -62,6 +62,64 @@ The worker runs in a loop — leave it running and it will pick up new `ai-task`
 
 The worker will pick it up on the next poll cycle.
 
+### Setting Up an Issue Template
+
+To make it easy for contributors to create AI tasks with the right label and structure, add a GitHub issue template to your target repo.
+
+1. Create the file `.github/ISSUE_TEMPLATE/ai-task.yml` in the target repository.
+2. Paste the following contents:
+
+```yaml
+name: Feature Request (AI)
+description: Request a feature to be built by the AI agent
+title: "[AI] "
+labels: ["ai-task"]
+
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature Description
+      description: Clearly describe the feature
+      placeholder: Add event capacity and prevent overbooking
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: Acceptance criteria
+      placeholder: |
+        - Add capacity field to event
+        - Prevent overbooking
+        - Show error in UI
+```
+
+3. Commit and push. A new "Feature Request (AI)" option will now appear when anyone opens an issue, pre-labeled with `ai-task`.
+
+## PR Feedback Comments
+
+Once Agatha opens a PR, you can ask it to make follow-up changes by commenting directly on the PR.
+
+### How It Works
+
+1. On any open PR created by the worker, leave a comment starting with `/agatha` followed by your feedback. For example:
+
+   ```
+   /agatha rename the `getUsers` function to `fetchActiveUsers` and add a JSDoc comment
+   ```
+
+2. The worker reacts with 👀 and comments that it's working on the feedback.
+3. It checks out the PR branch, sends your feedback to Claude Code, commits any resulting changes, and pushes to the same branch.
+4. When done, it replies with a summary and diff stats (or notes if no changes were needed).
+
+### Tips
+
+- One piece of feedback per comment works best — keep instructions focused.
+- The worker processes one comment at a time per poll cycle. If you leave multiple comments, they'll be handled in order.
+- If something goes wrong, the worker replies with the error details so you can adjust and try again.
+
 ## Labels
 
 | Label | Meaning |

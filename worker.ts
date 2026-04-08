@@ -421,7 +421,7 @@ async function processIssue(issue: IssueLike): Promise<void> {
   }
 }
 
-const COMMENT_PREFIX = "/agatha-ai";
+const COMMENT_PREFIX = "/agatha";
 const processedCommentIds = new Set<number>();
 
 async function reactToComment(commentId: number, reaction: "+1" | "eyes" | "rocket"): Promise<void> {
