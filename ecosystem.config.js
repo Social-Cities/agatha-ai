@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "github-claude-worker",
+      name: "agatha-ai",
       script: "dist/worker.js",
       cwd: "",
       autorestart: true,
