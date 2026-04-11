@@ -162,3 +162,8 @@ To view processes running
 ```
 pm2 list
 ```
+
+To view logs
+```
+pm2 logs api
+```
