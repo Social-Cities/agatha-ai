@@ -165,5 +165,5 @@ pm2 list
 
 To view logs
 ```
-pm2 logs api
+pm2 logs agatha-ai
 ```
