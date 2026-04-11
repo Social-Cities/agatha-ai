@@ -138,3 +138,14 @@ Each generated PR includes:
 - **Diff summary** — `git diff --stat` output
 - **Database migrations** — full SQL rendered in code blocks for easy copy/paste into Supabase
 - **Risks & notes** — edge cases or things to watch for during review
+
+
+# Running on mac as a persistent worker
+
+```
+npm install -g pm2
+npm run build
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup
+```
