@@ -142,10 +142,23 @@ Each generated PR includes:
 
 # Running on mac as a persistent worker
 
+To setup an install
 ```
 npm install -g pm2
 npm run build
 pm2 start ecosystem.config.js
 pm2 save
 pm2 startup
+```
+
+To remove the app
+```
+pm2 delete agatha-ai
+pm2 save --force
+```
+
+
+To view processes running
+```
+pm2 list
 ```
