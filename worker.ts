@@ -4,6 +4,10 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
 type IssueLike = {
   number: number;
   title: string;
@@ -26,6 +30,10 @@ type IssueComment = {
   body: string;
 };
 
+/* ------------------------------------------------------------------ */
+/*  Configuration                                                      */
+/* ------------------------------------------------------------------ */
+
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
 });
@@ -35,6 +43,9 @@ const REPO = process.env.GITHUB_REPO;
 const REPO_PATH = process.env.REPO_PATH;
 const BASE_BRANCH = process.env.BASE_BRANCH || "main";
 const POLL_MS = Number(process.env.POLL_MS || 30000);
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 3);
+const WORKTREE_DIR = path.join(REPO_PATH!, "..", ".ai-worktrees");
+const COMMENT_PREFIX = "/agatha";
 
 if (!process.env.GITHUB_TOKEN) {
   throw new Error("Missing GITHUB_TOKEN");
@@ -42,6 +53,17 @@ if (!process.env.GITHUB_TOKEN) {
 if (!OWNER || !REPO || !REPO_PATH) {
   throw new Error("Missing GITHUB_OWNER, GITHUB_REPO, or REPO_PATH");
 }
+
+/* ------------------------------------------------------------------ */
+/*  Job tracking                                                       */
+/* ------------------------------------------------------------------ */
+
+const activeJobs = new Map<string, Promise<void>>();
+const processedCommentIds = new Set<number>();
+
+/* ------------------------------------------------------------------ */
+/*  Shell helpers                                                      */
+/* ------------------------------------------------------------------ */
 
 function runCommand(
   command: string,
@@ -131,12 +153,139 @@ function runClaude(prompt: string, cwd: string): Promise<void> {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/*  Git worktree helpers                                               */
+/* ------------------------------------------------------------------ */
+
+function worktreePath(name: string): string {
+  return path.join(WORKTREE_DIR, name);
+}
+
+async function createWorktree(
+  name: string,
+  ref: string,
+  newBranch?: string
+): Promise<string> {
+  const wtPath = worktreePath(name);
+
+  // Prune stale worktree references (e.g. from a previous crash)
+  await runCommand("git", ["worktree", "prune"], REPO_PATH!);
+
+  // Force-remove if this worktree already exists
+  try {
+    await runCommand(
+      "git",
+      ["worktree", "remove", "--force", wtPath],
+      REPO_PATH!
+    );
+  } catch {
+    // Doesn't exist — that's fine
+  }
+
+  fs.mkdirSync(WORKTREE_DIR, { recursive: true });
+
+  const args = ["worktree", "add"];
+  if (newBranch) {
+    args.push("-B", newBranch);
+  } else {
+    args.push("--detach");
+  }
+  args.push(wtPath, ref);
+
+  await runCommand("git", args, REPO_PATH!);
+  return wtPath;
+}
+
+async function removeWorktree(name: string): Promise<void> {
+  try {
+    await runCommand(
+      "git",
+      ["worktree", "remove", "--force", worktreePath(name)],
+      REPO_PATH!
+    );
+  } catch {
+    // Ignore — may already be gone
+  }
+}
+
+async function cleanupWorktrees(): Promise<void> {
+  await runCommand("git", ["worktree", "prune"], REPO_PATH!);
+  try {
+    const entries = fs.readdirSync(WORKTREE_DIR);
+    for (const entry of entries) {
+      try {
+        await runCommand(
+          "git",
+          ["worktree", "remove", "--force", path.join(WORKTREE_DIR, entry)],
+          REPO_PATH!
+        );
+      } catch {
+        // Ignore
+      }
+    }
+  } catch {
+    // Directory doesn't exist yet — that's fine
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  String helpers                                                     */
+/* ------------------------------------------------------------------ */
+
 function safeBranchName(issueNumber: number): string {
   return `ai/issue-${issueNumber}`;
 }
 
 function sanitizeCommitMessage(input: string): string {
   return input.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Prompt builders                                                    */
+/* ------------------------------------------------------------------ */
+
+function buildClaudePrompt(issueTitle: string, issueBody: string): string {
+  return `
+You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+
+Your task is to implement the GitHub issue below.
+
+ISSUE TITLE:
+${issueTitle}
+
+ISSUE BODY:
+${issueBody}
+
+Rules:
+- Follow existing repository patterns and conventions.
+- Make the minimum set of changes necessary.
+- Do not refactor unrelated code.
+- Update frontend and backend as needed.
+- Preserve type safety.
+- Run the relevant validation commands before finishing.
+- If tests exist for the touched area, update or add them.
+- Do not create a pull request.
+- Do not push to git.
+- Do not change git remotes.
+- At the end, stop after code and local validation are complete.
+
+Before editing:
+1. Inspect the codebase and identify the files likely involved.
+2. Make a short implementation plan.
+3. Then implement.
+
+Before finishing:
+- Run build, typecheck, and tests as appropriate for this repo.
+- Write a file called ".ai-summary.md" at the repo root with the following sections:
+  ## Approach
+  A clear explanation of the technical approach you chose and why.
+  ## Changes
+  A file-by-file breakdown of what was changed and why.
+  ## Database Migrations
+  If any database migrations were created or modified, list them here with a brief description. Otherwise write "None".
+  ## Risks & Notes
+  Any risks, edge cases, or things the reviewer should pay attention to.
+`.trim();
 }
 
 function buildFeedbackPrompt(
@@ -179,50 +328,6 @@ Before finishing:
   A summary of the reviewer feedback and how you addressed it.
   ## Changes
   A file-by-file breakdown of what was changed and why.
-  ## Risks & Notes
-  Any risks, edge cases, or things the reviewer should pay attention to.
-`.trim();
-}
-
-function buildClaudePrompt(issueTitle: string, issueBody: string): string {
-  return `
-You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
-
-Your task is to implement the GitHub issue below.
-
-ISSUE TITLE:
-${issueTitle}
-
-ISSUE BODY:
-${issueBody}
-
-Rules:
-- Follow existing repository patterns and conventions.
-- Make the minimum set of changes necessary.
-- Do not refactor unrelated code.
-- Update frontend and backend as needed.
-- Preserve type safety.
-- Run the relevant validation commands before finishing.
-- If tests exist for the touched area, update or add them.
-- Do not create a pull request.
-- Do not push to git.
-- Do not change git remotes.
-- At the end, stop after code and local validation are complete.
-
-Before editing:
-1. Inspect the codebase and identify the files likely involved.
-2. Make a short implementation plan.
-3. Then implement.
-
-Before finishing:
-- Run build, typecheck, and tests as appropriate for this repo.
-- Write a file called ".ai-summary.md" at the repo root with the following sections:
-  ## Approach
-  A clear explanation of the technical approach you chose and why.
-  ## Changes
-  A file-by-file breakdown of what was changed and why.
-  ## Database Migrations
-  If any database migrations were created or modified, list them here with a brief description. Otherwise write "None".
   ## Risks & Notes
   Any risks, edge cases, or things the reviewer should pay attention to.
 `.trim();
@@ -302,6 +407,10 @@ Write the updated plan to ".ai-plan.md" at the repo root, keeping the same secti
 `.trim();
 }
 
+/* ------------------------------------------------------------------ */
+/*  GitHub helpers                                                     */
+/* ------------------------------------------------------------------ */
+
 async function addLabel(issueNumber: number, label: string): Promise<void> {
   await octokit.issues.addLabels({
     owner: OWNER!,
@@ -333,6 +442,18 @@ async function comment(issueNumber: number, body: string): Promise<void> {
   });
 }
 
+async function reactToComment(
+  commentId: number,
+  reaction: "+1" | "eyes" | "rocket"
+): Promise<void> {
+  await octokit.reactions.createForIssueComment({
+    owner: OWNER!,
+    repo: REPO!,
+    comment_id: commentId,
+    content: reaction,
+  });
+}
+
 async function markInProgress(issueNumber: number): Promise<void> {
   await addLabel(issueNumber, "ai-running");
   await removeLabel(issueNumber, "ai-task");
@@ -349,61 +470,28 @@ async function markDone(issueNumber: number): Promise<void> {
   await removeLabel(issueNumber, "ai-running");
 }
 
-async function processPlanIssue(issue: IssueLike): Promise<void> {
-  const issueNumber = issue.number;
-  const issueTitle = issue.title;
-  const issueBody = issue.body || "";
+/* ------------------------------------------------------------------ */
+/*  Plan extraction                                                    */
+/* ------------------------------------------------------------------ */
 
-  await addLabel(issueNumber, "ai-planning");
-  await removeLabel(issueNumber, "ai-plan");
+function extractPlanFromComment(body: string): string {
+  const header = "## 📋 Implementation Plan\n\n";
+  const revisedHeader = "## 📋 Implementation Plan (Revised)\n\n";
+  let planStart: number;
 
-  await comment(issueNumber, `🤖 Creating an implementation plan…`);
-
-  const prompt = buildPlanPrompt(issueTitle, issueBody);
-
-  try {
-    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
-    await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["pull", "origin", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["reset", "--hard", `origin/${BASE_BRANCH}`], REPO_PATH!);
-    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
-
-    await runClaude(prompt, REPO_PATH!);
-
-    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
-    let plan = "";
-    try {
-      plan = fs.readFileSync(planPath, "utf8");
-    } catch {
-      throw new Error("Claude completed, but no plan file (.ai-plan.md) was generated.");
-    }
-
-    await comment(issueNumber, `## 📋 Implementation Plan\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan, or add the \`ai-task\` label to start implementation._`);
-
-    await removeLabel(issueNumber, "ai-planning");
-    await addLabel(issueNumber, "ai-planned");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await comment(
-      issueNumber,
-      `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
-    );
-    await removeLabel(issueNumber, "ai-planning");
-    await addLabel(issueNumber, "ai-failed");
-  } finally {
-    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
-    try { fs.unlinkSync(planPath); } catch { /* ignore */ }
+  if (body.includes(revisedHeader)) {
+    planStart = body.indexOf(revisedHeader) + revisedHeader.length;
+  } else if (body.includes(header)) {
+    planStart = body.indexOf(header) + header.length;
+  } else {
+    return "";
   }
+
+  const planEnd = body.lastIndexOf("\n\n---\n");
+  return planEnd > planStart ? body.slice(planStart, planEnd) : body.slice(planStart);
 }
 
-async function processPlanFeedback(issueComment: IssueComment): Promise<void> {
-  const { id, issueNumber, issueTitle, issueBody, body } = issueComment;
-  processedCommentIds.add(id);
-
-  await reactToComment(id, "eyes");
-  await comment(issueNumber, `🤖 Revising the plan based on your feedback…\n\n> ${body.split("\n")[0]}`);
-
-  // Find the most recent plan comment
+async function findLatestPlan(issueNumber: number): Promise<string> {
   const comments = await octokit.issues.listComments({
     owner: OWNER!,
     repo: REPO!,
@@ -411,249 +499,18 @@ async function processPlanFeedback(issueComment: IssueComment): Promise<void> {
     per_page: 100,
   });
 
-  let currentPlan = "";
   for (const c of [...comments.data].reverse()) {
     if (c.body && c.body.includes("## 📋 Implementation Plan")) {
-      // Extract the plan content between the header and the trailing separator
-      const planStart = c.body.indexOf("## 📋 Implementation Plan\n\n") + "## 📋 Implementation Plan\n\n".length;
-      const planEnd = c.body.lastIndexOf("\n\n---\n");
-      currentPlan = planEnd > planStart ? c.body.slice(planStart, planEnd) : c.body.slice(planStart);
-      break;
+      const plan = extractPlanFromComment(c.body);
+      if (plan) return plan;
     }
   }
-
-  if (!currentPlan) {
-    await comment(issueNumber, `⚠️ Could not find an existing plan to revise. Add the \`ai-plan\` label to generate one first.`);
-    return;
-  }
-
-  const prompt = buildPlanRevisionPrompt(issueTitle, issueBody, currentPlan, body);
-
-  try {
-    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
-    await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["pull", "origin", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["reset", "--hard", `origin/${BASE_BRANCH}`], REPO_PATH!);
-    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
-
-    await runClaude(prompt, REPO_PATH!);
-
-    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
-    let plan = "";
-    try {
-      plan = fs.readFileSync(planPath, "utf8");
-    } catch {
-      throw new Error("Claude completed, but no updated plan file (.ai-plan.md) was generated.");
-    }
-
-    await comment(issueNumber, `## 📋 Implementation Plan (Revised)\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan further, or add the \`ai-task\` label to start implementation._`);
-    await reactToComment(id, "rocket");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await comment(
-      issueNumber,
-      `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
-    );
-  } finally {
-    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
-    try { fs.unlinkSync(planPath); } catch { /* ignore */ }
-  }
+  return "";
 }
 
-async function processIssue(issue: IssueLike): Promise<void> {
-  const issueNumber = issue.number;
-  const issueTitle = issue.title;
-  const issueBody = issue.body || "";
-  const branch = safeBranchName(issueNumber);
-  const promptFile = path.join(REPO_PATH!, `.ai-issue-${issueNumber}.md`);
-
-  await markInProgress(issueNumber);
-  await removeLabel(issueNumber, "ai-planned");
-
-  // Check if there's an existing plan from the ai-plan workflow
-  let existingPlan = "";
-  try {
-    const comments = await octokit.issues.listComments({
-      owner: OWNER!,
-      repo: REPO!,
-      issue_number: issueNumber,
-      per_page: 100,
-    });
-
-    for (const c of [...comments.data].reverse()) {
-      if (c.body && c.body.includes("## 📋 Implementation Plan")) {
-        const planStart = c.body.indexOf("## 📋 Implementation Plan\n\n") + "## 📋 Implementation Plan\n\n".length;
-        const planEnd = c.body.lastIndexOf("\n\n---\n");
-        existingPlan = planEnd > planStart ? c.body.slice(planStart, planEnd) : c.body.slice(planStart);
-        break;
-      }
-    }
-  } catch {
-    // No plan found — proceed without one
-  }
-
-  await comment(issueNumber, existingPlan
-    ? `🤖 Starting work on \`${branch}\` using the approved plan.`
-    : `🤖 Starting work on \`${branch}\``
-  );
-
-  const prompt = existingPlan
-    ? buildClaudePrompt(issueTitle, issueBody + "\n\n## Approved Implementation Plan\n\n" + existingPlan)
-    : buildClaudePrompt(issueTitle, issueBody);
-  fs.writeFileSync(promptFile, prompt, "utf8");
-
-  try {
-    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
-    await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["pull", "origin", BASE_BRANCH], REPO_PATH!);
-    await runCommand("git", ["reset", "--hard", `origin/${BASE_BRANCH}`], REPO_PATH!);
-    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
-
-    await runCommand("git", ["checkout", "-B", branch], REPO_PATH!);
-
-    await runClaude(prompt, REPO_PATH!);
-
-    const diffCheck = await runCommand("git", ["status", "--porcelain"], REPO_PATH!);
-    if (!diffCheck.stdout.trim()) {
-      throw new Error("Claude completed, but no file changes were detected.");
-    }
-
-    // Read the AI summary if it was generated
-    const summaryPath = path.join(REPO_PATH!, ".ai-summary.md");
-    let aiSummary = "";
-    try {
-      aiSummary = fs.readFileSync(summaryPath, "utf8");
-    } catch {
-      // Summary wasn't created — we'll build a minimal one from the diff
-    }
-
-    // Get diff stats for the PR description
-    const diffStat = await runCommand(
-      "git",
-      ["diff", "--stat", BASE_BRANCH],
-      REPO_PATH!
-    );
-
-    // Find migration files and read their contents
-    const diffFiles = await runCommand(
-      "git",
-      ["diff", "--name-only", BASE_BRANCH],
-      REPO_PATH!
-    );
-    const changedFiles = diffFiles.stdout.trim().split("\n").filter(Boolean);
-    const migrationFiles = changedFiles.filter(
-      (f) =>
-        f.endsWith(".sql") ||
-        f.includes("migration") ||
-        f.includes("supabase/migrations")
-    );
-
-    let migrationSection = "";
-    if (migrationFiles.length > 0) {
-      migrationSection = "## 🗄️ Database Migrations\n\n";
-      migrationSection +=
-        "The following migration files are included. Copy and paste into Supabase as needed:\n\n";
-      for (const migFile of migrationFiles) {
-        const fullPath = path.join(REPO_PATH!, migFile);
-        try {
-          const content = fs.readFileSync(fullPath, "utf8");
-          migrationSection += `### \`${migFile}\`\n\n\`\`\`sql\n${content}\n\`\`\`\n\n`;
-        } catch {
-          migrationSection += `### \`${migFile}\`\n\n_(could not read file)_\n\n`;
-        }
-      }
-    }
-
-    // Remove the summary file from the commit
-    try {
-      fs.unlinkSync(summaryPath);
-    } catch {
-      // Ignore if it doesn't exist
-    }
-
-    await runCommand("git", ["add", "."], REPO_PATH!);
-    await runCommand(
-      "git",
-      ["commit", "-m", `AI: ${sanitizeCommitMessage(issueTitle)}`],
-      REPO_PATH!
-    );
-    await runCommand("git", ["push", "-u", "origin", branch], REPO_PATH!);
-
-    const prBody = [
-      `Closes #${issueNumber}`,
-      "",
-      `> 🤖 This PR was generated by the local AI worker using Claude Code.`,
-      "",
-      aiSummary || `_No detailed summary was generated. Review the diff below._`,
-      "",
-      "## 📊 Diff Summary",
-      "",
-      "```",
-      diffStat.stdout.trim(),
-      "```",
-      "",
-      migrationSection,
-      "---",
-      "_Please review the Vercel preview and CI results before merging._",
-    ].join("\n");
-
-    const prBodyFile = path.join(REPO_PATH!, ".ai-pr-body.md");
-    fs.writeFileSync(prBodyFile, prBody, "utf8");
-
-    const pr = await runCommand(
-      "gh",
-      [
-        "pr",
-        "create",
-        "--title",
-        issueTitle,
-        "--body-file",
-        prBodyFile,
-        "--base",
-        BASE_BRANCH,
-        "--head",
-        branch,
-      ],
-      REPO_PATH!
-    );
-
-    try {
-      fs.unlinkSync(prBodyFile);
-    } catch {
-      // Ignore cleanup failure.
-    }
-
-    await comment(issueNumber, `✅ PR created:\n\n${pr.stdout}`);
-    await markDone(issueNumber);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await comment(
-      issueNumber,
-      `❌ Failed while processing this task.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
-    );
-    await markFailed(issueNumber);
-  } finally {
-    for (const f of [promptFile, path.join(REPO_PATH!, ".ai-summary.md"), path.join(REPO_PATH!, ".ai-pr-body.md")]) {
-      try {
-        fs.unlinkSync(f);
-      } catch {
-        // Ignore cleanup failure.
-      }
-    }
-  }
-}
-
-const COMMENT_PREFIX = "/agatha";
-const processedCommentIds = new Set<number>();
-
-async function reactToComment(commentId: number, reaction: "+1" | "eyes" | "rocket"): Promise<void> {
-  await octokit.reactions.createForIssueComment({
-    owner: OWNER!,
-    repo: REPO!,
-    comment_id: commentId,
-    content: reaction,
-  });
-}
+/* ------------------------------------------------------------------ */
+/*  Work item collectors                                               */
+/* ------------------------------------------------------------------ */
 
 async function getPendingPlanComments(): Promise<IssueComment[]> {
   const issues = await octokit.issues.listForRepo({
@@ -734,32 +591,316 @@ async function getPendingPRComments(): Promise<PRComment[]> {
   return pending;
 }
 
-async function processPRComment(prComment: PRComment): Promise<void> {
-  const { id, prNumber, prTitle, prBranch, body } = prComment;
-  processedCommentIds.add(id);
+/* ------------------------------------------------------------------ */
+/*  Process: plan an issue                                             */
+/* ------------------------------------------------------------------ */
+
+async function processPlanIssue(
+  issue: IssueLike,
+  workDir: string
+): Promise<void> {
+  const { number: issueNumber, title: issueTitle, body } = issue;
+  const issueBody = body || "";
+
+  await addLabel(issueNumber, "ai-planning");
+  await removeLabel(issueNumber, "ai-plan");
+
+  await comment(issueNumber, `🤖 Creating an implementation plan…`);
+
+  const prompt = buildPlanPrompt(issueTitle, issueBody);
+
+  try {
+    await runClaude(prompt, workDir);
+
+    const planPath = path.join(workDir, ".ai-plan.md");
+    let plan = "";
+    try {
+      plan = fs.readFileSync(planPath, "utf8");
+    } catch {
+      throw new Error(
+        "Claude completed, but no plan file (.ai-plan.md) was generated."
+      );
+    }
+
+    await comment(
+      issueNumber,
+      `## 📋 Implementation Plan\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan, or add the \`ai-task\` label to start implementation._`
+    );
+
+    await removeLabel(issueNumber, "ai-planning");
+    await addLabel(issueNumber, "ai-planned");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      issueNumber,
+      `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+    await removeLabel(issueNumber, "ai-planning");
+    await addLabel(issueNumber, "ai-failed");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Process: revise a plan based on feedback                           */
+/* ------------------------------------------------------------------ */
+
+async function processPlanFeedback(
+  issueComment: IssueComment,
+  workDir: string
+): Promise<void> {
+  const { id, issueNumber, issueTitle, issueBody, body } = issueComment;
 
   await reactToComment(id, "eyes");
-  await comment(prNumber, `🤖 Working on your feedback…\n\n> ${body.split("\n")[0]}`);
+  await comment(
+    issueNumber,
+    `🤖 Revising the plan based on your feedback…\n\n> ${body.split("\n")[0]}`
+  );
+
+  const currentPlan = await findLatestPlan(issueNumber);
+
+  if (!currentPlan) {
+    await comment(
+      issueNumber,
+      `⚠️ Could not find an existing plan to revise. Add the \`ai-plan\` label to generate one first.`
+    );
+    return;
+  }
+
+  const prompt = buildPlanRevisionPrompt(
+    issueTitle,
+    issueBody,
+    currentPlan,
+    body
+  );
+
+  try {
+    await runClaude(prompt, workDir);
+
+    const planPath = path.join(workDir, ".ai-plan.md");
+    let plan = "";
+    try {
+      plan = fs.readFileSync(planPath, "utf8");
+    } catch {
+      throw new Error(
+        "Claude completed, but no updated plan file (.ai-plan.md) was generated."
+      );
+    }
+
+    await comment(
+      issueNumber,
+      `## 📋 Implementation Plan (Revised)\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan further, or add the \`ai-task\` label to start implementation._`
+    );
+    await reactToComment(id, "rocket");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      issueNumber,
+      `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Process: implement an issue                                        */
+/* ------------------------------------------------------------------ */
+
+async function processIssue(
+  issue: IssueLike,
+  workDir: string
+): Promise<void> {
+  const { number: issueNumber, title: issueTitle, body } = issue;
+  const issueBody = body || "";
+  const branch = safeBranchName(issueNumber);
+
+  await markInProgress(issueNumber);
+  await removeLabel(issueNumber, "ai-planned");
+
+  // Check if there's an existing plan from the ai-plan workflow
+  const existingPlan = await findLatestPlan(issueNumber);
+
+  await comment(
+    issueNumber,
+    existingPlan
+      ? `🤖 Starting work on \`${branch}\` using the approved plan.`
+      : `🤖 Starting work on \`${branch}\``
+  );
+
+  const prompt = existingPlan
+    ? buildClaudePrompt(
+        issueTitle,
+        issueBody + "\n\n## Approved Implementation Plan\n\n" + existingPlan
+      )
+    : buildClaudePrompt(issueTitle, issueBody);
+
+  try {
+    await runClaude(prompt, workDir);
+
+    const diffCheck = await runCommand(
+      "git",
+      ["status", "--porcelain"],
+      workDir
+    );
+    if (!diffCheck.stdout.trim()) {
+      throw new Error("Claude completed, but no file changes were detected.");
+    }
+
+    // Read the AI summary if it was generated
+    const summaryPath = path.join(workDir, ".ai-summary.md");
+    let aiSummary = "";
+    try {
+      aiSummary = fs.readFileSync(summaryPath, "utf8");
+    } catch {
+      // Summary wasn't created — we'll build a minimal one from the diff
+    }
+
+    // Get diff stats for the PR description
+    const diffStat = await runCommand(
+      "git",
+      ["diff", "--stat", BASE_BRANCH],
+      workDir
+    );
+
+    // Find migration files and read their contents
+    const diffFiles = await runCommand(
+      "git",
+      ["diff", "--name-only", BASE_BRANCH],
+      workDir
+    );
+    const changedFiles = diffFiles.stdout.trim().split("\n").filter(Boolean);
+    const migrationFiles = changedFiles.filter(
+      (f) =>
+        f.endsWith(".sql") ||
+        f.includes("migration") ||
+        f.includes("supabase/migrations")
+    );
+
+    let migrationSection = "";
+    if (migrationFiles.length > 0) {
+      migrationSection = "## 🗄️ Database Migrations\n\n";
+      migrationSection +=
+        "The following migration files are included. Copy and paste into Supabase as needed:\n\n";
+      for (const migFile of migrationFiles) {
+        const fullPath = path.join(workDir, migFile);
+        try {
+          const content = fs.readFileSync(fullPath, "utf8");
+          migrationSection += `### \`${migFile}\`\n\n\`\`\`sql\n${content}\n\`\`\`\n\n`;
+        } catch {
+          migrationSection += `### \`${migFile}\`\n\n_(could not read file)_\n\n`;
+        }
+      }
+    }
+
+    // Remove the summary file before committing
+    try {
+      fs.unlinkSync(summaryPath);
+    } catch {
+      // Ignore if it doesn't exist
+    }
+
+    await runCommand("git", ["add", "."], workDir);
+    await runCommand(
+      "git",
+      ["commit", "-m", `AI: ${sanitizeCommitMessage(issueTitle)}`],
+      workDir
+    );
+    await runCommand(
+      "git",
+      ["push", "-u", "origin", branch],
+      workDir
+    );
+
+    const prBody = [
+      `Closes #${issueNumber}`,
+      "",
+      `> 🤖 This PR was generated by the local AI worker using Claude Code.`,
+      "",
+      aiSummary || `_No detailed summary was generated. Review the diff below._`,
+      "",
+      "## 📊 Diff Summary",
+      "",
+      "```",
+      diffStat.stdout.trim(),
+      "```",
+      "",
+      migrationSection,
+      "---",
+      "_Please review the Vercel preview and CI results before merging._",
+    ].join("\n");
+
+    const prBodyFile = path.join(workDir, ".ai-pr-body.md");
+    fs.writeFileSync(prBodyFile, prBody, "utf8");
+
+    const pr = await runCommand(
+      "gh",
+      [
+        "pr",
+        "create",
+        "--title",
+        issueTitle,
+        "--body-file",
+        prBodyFile,
+        "--base",
+        BASE_BRANCH,
+        "--head",
+        branch,
+      ],
+      workDir
+    );
+
+    try {
+      fs.unlinkSync(prBodyFile);
+    } catch {
+      // Ignore cleanup failure.
+    }
+
+    await comment(issueNumber, `✅ PR created:\n\n${pr.stdout}`);
+    await markDone(issueNumber);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      issueNumber,
+      `❌ Failed while processing this task.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+    await markFailed(issueNumber);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Process: PR feedback                                               */
+/* ------------------------------------------------------------------ */
+
+async function processPRComment(
+  prComment: PRComment,
+  workDir: string
+): Promise<void> {
+  const { id, prNumber, prTitle, prBranch, body } = prComment;
+
+  await reactToComment(id, "eyes");
+  await comment(
+    prNumber,
+    `🤖 Working on your feedback…\n\n> ${body.split("\n")[0]}`
+  );
 
   const prompt = buildFeedbackPrompt(prTitle, body);
 
   try {
-    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
-    await runCommand("git", ["checkout", prBranch], REPO_PATH!);
-    await runCommand("git", ["pull", "origin", prBranch], REPO_PATH!);
-    await runCommand("git", ["reset", "--hard", `origin/${prBranch}`], REPO_PATH!);
-    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
+    await runClaude(prompt, workDir);
 
-    await runClaude(prompt, REPO_PATH!);
-
-    const diffCheck = await runCommand("git", ["status", "--porcelain"], REPO_PATH!);
+    const diffCheck = await runCommand(
+      "git",
+      ["status", "--porcelain"],
+      workDir
+    );
     if (!diffCheck.stdout.trim()) {
-      await comment(prNumber, `⚠️ I reviewed the feedback but found no code changes were needed.`);
+      await comment(
+        prNumber,
+        `⚠️ I reviewed the feedback but found no code changes were needed.`
+      );
       return;
     }
 
     // Read the AI summary if it was generated
-    const summaryPath = path.join(REPO_PATH!, ".ai-summary.md");
+    const summaryPath = path.join(workDir, ".ai-summary.md");
     let aiSummary = "";
     try {
       aiSummary = fs.readFileSync(summaryPath, "utf8");
@@ -778,16 +919,16 @@ async function processPRComment(prComment: PRComment): Promise<void> {
     const diffStat = await runCommand(
       "git",
       ["diff", "--stat", `origin/${prBranch}`],
-      REPO_PATH!
+      workDir
     );
 
-    await runCommand("git", ["add", "."], REPO_PATH!);
+    await runCommand("git", ["add", "."], workDir);
     await runCommand(
       "git",
       ["commit", "-m", `AI: address feedback on #${prNumber}`],
-      REPO_PATH!
+      workDir
     );
-    await runCommand("git", ["push", "origin", prBranch], REPO_PATH!);
+    await runCommand("git", ["push", "origin", prBranch], workDir);
 
     const responseBody = [
       `✅ I've pushed changes to address your feedback.`,
@@ -809,100 +950,195 @@ async function processPRComment(prComment: PRComment): Promise<void> {
       prNumber,
       `❌ Failed while addressing feedback.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
     );
-  } finally {
-    const summaryPath = path.join(REPO_PATH!, ".ai-summary.md");
-    try {
-      fs.unlinkSync(summaryPath);
-    } catch {
-      // Ignore cleanup failure.
-    }
   }
 }
 
-let running = false;
+/* ------------------------------------------------------------------ */
+/*  Job dispatcher                                                     */
+/* ------------------------------------------------------------------ */
+
+function dispatch(
+  key: string,
+  worktreeName: string,
+  ref: string,
+  newBranch: string | undefined,
+  fn: (workDir: string) => Promise<void>
+): void {
+  const job = (async () => {
+    const workDir = await createWorktree(worktreeName, ref, newBranch);
+    try {
+      await fn(workDir);
+    } finally {
+      await removeWorktree(worktreeName);
+    }
+  })();
+
+  const tracked = job.catch((error) => {
+    console.error(`Job [${key}] failed:`, error);
+  }).finally(() => {
+    activeJobs.delete(key);
+  });
+
+  activeJobs.set(key, tracked);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Poll loop                                                          */
+/* ------------------------------------------------------------------ */
+
+let polling = false;
 
 async function poll(): Promise<void> {
-  if (running) return;
-  running = true;
+  if (polling) return;
+  polling = true;
 
   try {
-    // 1. Check for plan feedback comments (on ai-planned issues)
-    const pendingPlanComments = await getPendingPlanComments();
-    if (pendingPlanComments.length > 0) {
-      await processPlanFeedback(pendingPlanComments[0]);
-      return;
+    if (activeJobs.size >= MAX_CONCURRENT) return;
+
+    // Single fetch for all jobs — worktrees share the object store
+    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
+
+    const slots = () => MAX_CONCURRENT - activeJobs.size;
+
+    // 1. Plan feedback comments (on ai-planned issues)
+    if (slots() > 0) {
+      const pendingPlanComments = await getPendingPlanComments();
+      for (const pc of pendingPlanComments) {
+        if (slots() <= 0) break;
+        const key = `plan-${pc.issueNumber}`;
+        if (activeJobs.has(key)) continue;
+        processedCommentIds.add(pc.id);
+        dispatch(
+          key,
+          `plan-${pc.issueNumber}`,
+          `origin/${BASE_BRANCH}`,
+          undefined,
+          (workDir) => processPlanFeedback(pc, workDir)
+        );
+      }
     }
 
-    // 2. Check for PR feedback comments
-    const pendingComments = await getPendingPRComments();
-    if (pendingComments.length > 0) {
-      await processPRComment(pendingComments[0]);
-      return;
+    // 2. PR feedback comments
+    if (slots() > 0) {
+      const pendingPRComments = await getPendingPRComments();
+      for (const pc of pendingPRComments) {
+        if (slots() <= 0) break;
+        const key = `pr-${pc.prNumber}`;
+        if (activeJobs.has(key)) continue;
+        processedCommentIds.add(pc.id);
+        dispatch(
+          key,
+          `pr-${pc.prNumber}`,
+          `origin/${pc.prBranch}`,
+          pc.prBranch,
+          (workDir) => processPRComment(pc, workDir)
+        );
+      }
     }
 
-    // 3. Check for issues needing a plan
-    const planIssues = await octokit.issues.listForRepo({
-      owner: OWNER!,
-      repo: REPO!,
-      state: "open",
-      labels: "ai-plan",
-      per_page: 20,
-    });
-
-    for (const issue of planIssues.data) {
-      const labelNames = issue.labels.map((label) =>
-        typeof label === "string" ? label : label.name || ""
-      );
-
-      if (labelNames.includes("ai-planning")) continue;
-      if ("pull_request" in issue && issue.pull_request) continue;
-
-      await processPlanIssue({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body ?? null,
+    // 3. Issues needing a plan
+    if (slots() > 0) {
+      const planIssues = await octokit.issues.listForRepo({
+        owner: OWNER!,
+        repo: REPO!,
+        state: "open",
+        labels: "ai-plan",
+        per_page: 20,
       });
 
-      return;
+      for (const issue of planIssues.data) {
+        if (slots() <= 0) break;
+        const labelNames = issue.labels.map((label) =>
+          typeof label === "string" ? label : label.name || ""
+        );
+        if (labelNames.includes("ai-planning")) continue;
+        if ("pull_request" in issue && issue.pull_request) continue;
+
+        const key = `plan-${issue.number}`;
+        if (activeJobs.has(key)) continue;
+
+        dispatch(
+          key,
+          `plan-${issue.number}`,
+          `origin/${BASE_BRANCH}`,
+          undefined,
+          (workDir) =>
+            processPlanIssue(
+              { number: issue.number, title: issue.title, body: issue.body ?? null },
+              workDir
+            )
+        );
+      }
     }
 
-    // 4. Check for issues ready for implementation
-    const issues = await octokit.issues.listForRepo({
-      owner: OWNER!,
-      repo: REPO!,
-      state: "open",
-      labels: "ai-task",
-      per_page: 20,
-    });
-
-    for (const issue of issues.data) {
-      const labelNames = issue.labels.map((label) =>
-        typeof label === "string" ? label : label.name || ""
-      );
-
-      if (labelNames.includes("ai-running")) continue;
-      if ("pull_request" in issue && issue.pull_request) continue;
-
-      await processIssue({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body ?? null,
+    // 4. Issues ready for implementation
+    if (slots() > 0) {
+      const issues = await octokit.issues.listForRepo({
+        owner: OWNER!,
+        repo: REPO!,
+        state: "open",
+        labels: "ai-task",
+        per_page: 20,
       });
 
-      // Process one job at a time.
-      break;
+      for (const issue of issues.data) {
+        if (slots() <= 0) break;
+        const labelNames = issue.labels.map((label) =>
+          typeof label === "string" ? label : label.name || ""
+        );
+        if (labelNames.includes("ai-running")) continue;
+        if ("pull_request" in issue && issue.pull_request) continue;
+
+        const key = `issue-${issue.number}`;
+        if (activeJobs.has(key)) continue;
+
+        const branch = safeBranchName(issue.number);
+        dispatch(
+          key,
+          `issue-${issue.number}`,
+          `origin/${BASE_BRANCH}`,
+          branch,
+          (workDir) =>
+            processIssue(
+              { number: issue.number, title: issue.title, body: issue.body ?? null },
+              workDir
+            )
+        );
+      }
     }
   } finally {
-    running = false;
+    polling = false;
   }
 }
 
-setInterval(() => {
-  poll().catch((error) => {
-    console.error("Poll loop failed:", error);
-  });
-}, POLL_MS);
+/* ------------------------------------------------------------------ */
+/*  Startup                                                            */
+/* ------------------------------------------------------------------ */
 
-poll().catch((error) => {
-  console.error("Initial poll failed:", error);
+async function start(): Promise<void> {
+  console.log(
+    `Agatha worker starting — polling every ${POLL_MS}ms, max ${MAX_CONCURRENT} concurrent jobs`
+  );
+  console.log(`Repo: ${REPO_PATH}`);
+  console.log(`Worktrees: ${WORKTREE_DIR}`);
+
+  // Clean up any leftover worktrees from a previous run
+  await cleanupWorktrees();
+
+  // Ensure main repo is on the base branch so worktree branch creation never conflicts
+  await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
+
+  // Start polling
+  setInterval(() => {
+    poll().catch((error) => {
+      console.error("Poll loop failed:", error);
+    });
+  }, POLL_MS);
+
+  await poll();
+}
+
+start().catch((error) => {
+  console.error("Startup failed:", error);
+  process.exit(1);
 });
