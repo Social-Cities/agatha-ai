@@ -18,6 +18,14 @@ type PRComment = {
   body: string;
 };
 
+type IssueComment = {
+  id: number;
+  issueNumber: number;
+  issueTitle: string;
+  issueBody: string;
+  body: string;
+};
+
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
 });
@@ -220,6 +228,80 @@ Before finishing:
 `.trim();
 }
 
+function buildPlanPrompt(issueTitle: string, issueBody: string): string {
+  return `
+You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+
+Your task is to create a detailed implementation plan for the GitHub issue below. Do NOT implement anything — only plan.
+
+ISSUE TITLE:
+${issueTitle}
+
+ISSUE BODY:
+${issueBody}
+
+Rules:
+- Inspect the codebase thoroughly before planning.
+- Follow existing repository patterns and conventions.
+- Do not create, edit, or delete any source files.
+- Do not create a pull request or push to git.
+
+Create a plan and write it to a file called ".ai-plan.md" at the repo root with the following sections:
+
+## Summary
+A brief overview of what needs to be done and the overall approach.
+
+## Files to Change
+A list of files that will need to be created, modified, or deleted, with a brief description of the changes for each.
+
+## Implementation Steps
+A numbered list of concrete implementation steps in the order they should be executed. Each step should be specific enough that an engineer (or AI) could follow it without ambiguity.
+
+## Database Migrations
+If any database migrations are needed, describe them here. Otherwise write "None".
+
+## Testing Strategy
+How the changes should be tested — which existing tests to update, any new tests to add.
+
+## Risks & Open Questions
+Any risks, edge cases, ambiguities, or decisions that need human input before implementation.
+`.trim();
+}
+
+function buildPlanRevisionPrompt(
+  issueTitle: string,
+  issueBody: string,
+  currentPlan: string,
+  feedback: string
+): string {
+  return `
+You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+
+You previously created an implementation plan for the GitHub issue below. A reviewer has provided feedback on the plan. Update the plan accordingly.
+
+ISSUE TITLE:
+${issueTitle}
+
+ISSUE BODY:
+${issueBody}
+
+CURRENT PLAN:
+${currentPlan}
+
+REVIEWER FEEDBACK:
+${feedback}
+
+Rules:
+- Inspect the codebase as needed to address the feedback.
+- Follow existing repository patterns and conventions.
+- Do not create, edit, or delete any source files (only update the plan).
+- Do not create a pull request or push to git.
+
+Write the updated plan to ".ai-plan.md" at the repo root, keeping the same sections:
+## Summary, ## Files to Change, ## Implementation Steps, ## Database Migrations, ## Testing Strategy, ## Risks & Open Questions
+`.trim();
+}
+
 async function addLabel(issueNumber: number, label: string): Promise<void> {
   await octokit.issues.addLabels({
     owner: OWNER!,
@@ -267,6 +349,117 @@ async function markDone(issueNumber: number): Promise<void> {
   await removeLabel(issueNumber, "ai-running");
 }
 
+async function processPlanIssue(issue: IssueLike): Promise<void> {
+  const issueNumber = issue.number;
+  const issueTitle = issue.title;
+  const issueBody = issue.body || "";
+
+  await addLabel(issueNumber, "ai-planning");
+  await removeLabel(issueNumber, "ai-plan");
+
+  await comment(issueNumber, `🤖 Creating an implementation plan…`);
+
+  const prompt = buildPlanPrompt(issueTitle, issueBody);
+
+  try {
+    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
+    await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
+    await runCommand("git", ["pull", "origin", BASE_BRANCH], REPO_PATH!);
+    await runCommand("git", ["reset", "--hard", `origin/${BASE_BRANCH}`], REPO_PATH!);
+    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
+
+    await runClaude(prompt, REPO_PATH!);
+
+    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
+    let plan = "";
+    try {
+      plan = fs.readFileSync(planPath, "utf8");
+    } catch {
+      throw new Error("Claude completed, but no plan file (.ai-plan.md) was generated.");
+    }
+
+    await comment(issueNumber, `## 📋 Implementation Plan\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan, or add the \`ai-task\` label to start implementation._`);
+
+    await removeLabel(issueNumber, "ai-planning");
+    await addLabel(issueNumber, "ai-planned");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      issueNumber,
+      `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+    await removeLabel(issueNumber, "ai-planning");
+    await addLabel(issueNumber, "ai-failed");
+  } finally {
+    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
+    try { fs.unlinkSync(planPath); } catch { /* ignore */ }
+  }
+}
+
+async function processPlanFeedback(issueComment: IssueComment): Promise<void> {
+  const { id, issueNumber, issueTitle, issueBody, body } = issueComment;
+  processedCommentIds.add(id);
+
+  await reactToComment(id, "eyes");
+  await comment(issueNumber, `🤖 Revising the plan based on your feedback…\n\n> ${body.split("\n")[0]}`);
+
+  // Find the most recent plan comment
+  const comments = await octokit.issues.listComments({
+    owner: OWNER!,
+    repo: REPO!,
+    issue_number: issueNumber,
+    per_page: 100,
+  });
+
+  let currentPlan = "";
+  for (const c of [...comments.data].reverse()) {
+    if (c.body && c.body.includes("## 📋 Implementation Plan")) {
+      // Extract the plan content between the header and the trailing separator
+      const planStart = c.body.indexOf("## 📋 Implementation Plan\n\n") + "## 📋 Implementation Plan\n\n".length;
+      const planEnd = c.body.lastIndexOf("\n\n---\n");
+      currentPlan = planEnd > planStart ? c.body.slice(planStart, planEnd) : c.body.slice(planStart);
+      break;
+    }
+  }
+
+  if (!currentPlan) {
+    await comment(issueNumber, `⚠️ Could not find an existing plan to revise. Add the \`ai-plan\` label to generate one first.`);
+    return;
+  }
+
+  const prompt = buildPlanRevisionPrompt(issueTitle, issueBody, currentPlan, body);
+
+  try {
+    await runCommand("git", ["fetch", "origin"], REPO_PATH!);
+    await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
+    await runCommand("git", ["pull", "origin", BASE_BRANCH], REPO_PATH!);
+    await runCommand("git", ["reset", "--hard", `origin/${BASE_BRANCH}`], REPO_PATH!);
+    await runCommand("git", ["clean", "-fd"], REPO_PATH!);
+
+    await runClaude(prompt, REPO_PATH!);
+
+    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
+    let plan = "";
+    try {
+      plan = fs.readFileSync(planPath, "utf8");
+    } catch {
+      throw new Error("Claude completed, but no updated plan file (.ai-plan.md) was generated.");
+    }
+
+    await comment(issueNumber, `## 📋 Implementation Plan (Revised)\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan further, or add the \`ai-task\` label to start implementation._`);
+    await reactToComment(id, "rocket");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await comment(
+      issueNumber,
+      `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+    );
+  } finally {
+    const planPath = path.join(REPO_PATH!, ".ai-plan.md");
+    try { fs.unlinkSync(planPath); } catch { /* ignore */ }
+  }
+}
+
 async function processIssue(issue: IssueLike): Promise<void> {
   const issueNumber = issue.number;
   const issueTitle = issue.title;
@@ -275,9 +468,38 @@ async function processIssue(issue: IssueLike): Promise<void> {
   const promptFile = path.join(REPO_PATH!, `.ai-issue-${issueNumber}.md`);
 
   await markInProgress(issueNumber);
-  await comment(issueNumber, `🤖 Starting work on \`${branch}\``);
+  await removeLabel(issueNumber, "ai-planned");
 
-  const prompt = buildClaudePrompt(issueTitle, issueBody);
+  // Check if there's an existing plan from the ai-plan workflow
+  let existingPlan = "";
+  try {
+    const comments = await octokit.issues.listComments({
+      owner: OWNER!,
+      repo: REPO!,
+      issue_number: issueNumber,
+      per_page: 100,
+    });
+
+    for (const c of [...comments.data].reverse()) {
+      if (c.body && c.body.includes("## 📋 Implementation Plan")) {
+        const planStart = c.body.indexOf("## 📋 Implementation Plan\n\n") + "## 📋 Implementation Plan\n\n".length;
+        const planEnd = c.body.lastIndexOf("\n\n---\n");
+        existingPlan = planEnd > planStart ? c.body.slice(planStart, planEnd) : c.body.slice(planStart);
+        break;
+      }
+    }
+  } catch {
+    // No plan found — proceed without one
+  }
+
+  await comment(issueNumber, existingPlan
+    ? `🤖 Starting work on \`${branch}\` using the approved plan.`
+    : `🤖 Starting work on \`${branch}\``
+  );
+
+  const prompt = existingPlan
+    ? buildClaudePrompt(issueTitle, issueBody + "\n\n## Approved Implementation Plan\n\n" + existingPlan)
+    : buildClaudePrompt(issueTitle, issueBody);
   fs.writeFileSync(promptFile, prompt, "utf8");
 
   try {
@@ -433,6 +655,47 @@ async function reactToComment(commentId: number, reaction: "+1" | "eyes" | "rock
   });
 }
 
+async function getPendingPlanComments(): Promise<IssueComment[]> {
+  const issues = await octokit.issues.listForRepo({
+    owner: OWNER!,
+    repo: REPO!,
+    state: "open",
+    labels: "ai-planned",
+    per_page: 50,
+  });
+
+  const pending: IssueComment[] = [];
+
+  for (const issue of issues.data) {
+    if ("pull_request" in issue && issue.pull_request) continue;
+
+    const comments = await octokit.issues.listComments({
+      owner: OWNER!,
+      repo: REPO!,
+      issue_number: issue.number,
+      per_page: 100,
+    });
+
+    for (const c of comments.data) {
+      if (
+        c.body &&
+        c.body.trimStart().startsWith(COMMENT_PREFIX) &&
+        !processedCommentIds.has(c.id)
+      ) {
+        pending.push({
+          id: c.id,
+          issueNumber: issue.number,
+          issueTitle: issue.title,
+          issueBody: issue.body || "",
+          body: c.body.trimStart().slice(COMMENT_PREFIX.length).trim(),
+        });
+      }
+    }
+  }
+
+  return pending;
+}
+
 async function getPendingPRComments(): Promise<PRComment[]> {
   const pulls = await octokit.pulls.list({
     owner: OWNER!,
@@ -563,14 +826,47 @@ async function poll(): Promise<void> {
   running = true;
 
   try {
-    // Check for PR feedback comments first
+    // 1. Check for plan feedback comments (on ai-planned issues)
+    const pendingPlanComments = await getPendingPlanComments();
+    if (pendingPlanComments.length > 0) {
+      await processPlanFeedback(pendingPlanComments[0]);
+      return;
+    }
+
+    // 2. Check for PR feedback comments
     const pendingComments = await getPendingPRComments();
     if (pendingComments.length > 0) {
       await processPRComment(pendingComments[0]);
       return;
     }
 
-    // Then check for new issues
+    // 3. Check for issues needing a plan
+    const planIssues = await octokit.issues.listForRepo({
+      owner: OWNER!,
+      repo: REPO!,
+      state: "open",
+      labels: "ai-plan",
+      per_page: 20,
+    });
+
+    for (const issue of planIssues.data) {
+      const labelNames = issue.labels.map((label) =>
+        typeof label === "string" ? label : label.name || ""
+      );
+
+      if (labelNames.includes("ai-planning")) continue;
+      if ("pull_request" in issue && issue.pull_request) continue;
+
+      await processPlanIssue({
+        number: issue.number,
+        title: issue.title,
+        body: issue.body ?? null,
+      });
+
+      return;
+    }
+
+    // 4. Check for issues ready for implementation
     const issues = await octokit.issues.listForRepo({
       owner: OWNER!,
       repo: REPO!,
