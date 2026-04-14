@@ -8,6 +8,8 @@ import path from "path";
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
+type PlanAgent = "claude" | "codex";
+
 type IssueLike = {
   number: number;
   title: string;
@@ -27,6 +29,7 @@ type IssueComment = {
   issueNumber: number;
   issueTitle: string;
   issueBody: string;
+  issueLabels: string[];
   body: string;
 };
 
@@ -151,6 +154,59 @@ function runClaude(prompt: string, cwd: string): Promise<void> {
     child.stdin.write(prompt);
     child.stdin.end();
   });
+}
+
+function runCodex(prompt: string, cwd: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "codex",
+      ["exec", "--full-auto", prompt],
+      {
+        cwd,
+        env: process.env,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => {
+      const text = data.toString();
+      stdout += text;
+      process.stdout.write(text);
+    });
+
+    child.stderr.on("data", (data) => {
+      const text = data.toString();
+      stderr += text;
+      process.stderr.write(text);
+    });
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            `codex failed with code ${code}\n\nSTDOUT:\n${stdout}\n\nSTDERR:\n${stderr}`
+          )
+        );
+      }
+    });
+  });
+}
+
+function runPlanAgent(
+  agent: PlanAgent,
+  prompt: string,
+  cwd: string
+): Promise<void> {
+  if (agent === "codex") return runCodex(prompt, cwd);
+  return runClaude(prompt, cwd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -411,6 +467,11 @@ Write the updated plan to ".ai-plan.md" at the repo root, keeping the same secti
 /*  GitHub helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+function detectPlanAgent(labels: string[]): PlanAgent {
+  if (labels.includes("codex")) return "codex";
+  return "claude";
+}
+
 async function addLabel(issueNumber: number, label: string): Promise<void> {
   await octokit.issues.addLabels({
     owner: OWNER!,
@@ -544,6 +605,9 @@ async function getPendingPlanComments(): Promise<IssueComment[]> {
           issueNumber: issue.number,
           issueTitle: issue.title,
           issueBody: issue.body || "",
+          issueLabels: issue.labels.map((label) =>
+            typeof label === "string" ? label : label.name || ""
+          ),
           body: c.body.trimStart().slice(COMMENT_PREFIX.length).trim(),
         });
       }
@@ -597,7 +661,8 @@ async function getPendingPRComments(): Promise<PRComment[]> {
 
 async function processPlanIssue(
   issue: IssueLike,
-  workDir: string
+  workDir: string,
+  agent: PlanAgent = "claude"
 ): Promise<void> {
   const { number: issueNumber, title: issueTitle, body } = issue;
   const issueBody = body || "";
@@ -605,12 +670,13 @@ async function processPlanIssue(
   await addLabel(issueNumber, "ai-planning");
   await removeLabel(issueNumber, "ai-plan");
 
-  await comment(issueNumber, `🤖 Creating an implementation plan…`);
+  const agentName = agent === "codex" ? "Codex" : "Claude";
+  await comment(issueNumber, `🤖 Creating an implementation plan using ${agentName}…`);
 
   const prompt = buildPlanPrompt(issueTitle, issueBody);
 
   try {
-    await runClaude(prompt, workDir);
+    await runPlanAgent(agent, prompt, workDir);
 
     const planPath = path.join(workDir, ".ai-plan.md");
     let plan = "";
@@ -646,14 +712,16 @@ async function processPlanIssue(
 
 async function processPlanFeedback(
   issueComment: IssueComment,
-  workDir: string
+  workDir: string,
+  agent: PlanAgent = "claude"
 ): Promise<void> {
   const { id, issueNumber, issueTitle, issueBody, body } = issueComment;
 
+  const agentName = agent === "codex" ? "Codex" : "Claude";
   await reactToComment(id, "eyes");
   await comment(
     issueNumber,
-    `🤖 Revising the plan based on your feedback…\n\n> ${body.split("\n")[0]}`
+    `🤖 Revising the plan using ${agentName} based on your feedback…\n\n> ${body.split("\n")[0]}`
   );
 
   const currentPlan = await findLatestPlan(issueNumber);
@@ -674,7 +742,7 @@ async function processPlanFeedback(
   );
 
   try {
-    await runClaude(prompt, workDir);
+    await runPlanAgent(agent, prompt, workDir);
 
     const planPath = path.join(workDir, ".ai-plan.md");
     let plan = "";
@@ -1008,12 +1076,13 @@ async function poll(): Promise<void> {
         const key = `plan-${pc.issueNumber}`;
         if (activeJobs.has(key)) continue;
         processedCommentIds.add(pc.id);
+        const agent = detectPlanAgent(pc.issueLabels);
         dispatch(
           key,
           `plan-${pc.issueNumber}`,
           `origin/${BASE_BRANCH}`,
           undefined,
-          (workDir) => processPlanFeedback(pc, workDir)
+          (workDir) => processPlanFeedback(pc, workDir, agent)
         );
       }
     }
@@ -1057,6 +1126,7 @@ async function poll(): Promise<void> {
         const key = `plan-${issue.number}`;
         if (activeJobs.has(key)) continue;
 
+        const agent = detectPlanAgent(labelNames);
         dispatch(
           key,
           `plan-${issue.number}`,
@@ -1065,7 +1135,8 @@ async function poll(): Promise<void> {
           (workDir) =>
             processPlanIssue(
               { number: issue.number, title: issue.title, body: issue.body ?? null },
-              workDir
+              workDir,
+              agent
             )
         );
       }
