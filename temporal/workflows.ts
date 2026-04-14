@@ -19,11 +19,16 @@ const {
   processPlanIssueActivity,
   processPlanFeedbackActivity,
   processIssueActivity,
-  processPRCommentActivity,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: "45m",
   heartbeatTimeout: "2m",
   retry: { maximumAttempts: 2, backoffCoefficient: 1 },
+});
+
+const { processPRCommentActivity } = proxyActivities<typeof activities>({
+  startToCloseTimeout: "45m",
+  heartbeatTimeout: "2m",
+  retry: { maximumAttempts: 1 },
 });
 
 /* ------------------------------------------------------------------ */

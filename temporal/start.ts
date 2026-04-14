@@ -1,6 +1,9 @@
 import "dotenv/config";
 import { Client, Connection } from "@temporalio/client";
-import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+import {
+  WorkflowExecutionAlreadyStartedError,
+  WorkflowIdReusePolicy,
+} from "@temporalio/common";
 import {
   octokit,
   OWNER,
@@ -39,13 +42,18 @@ async function startPoller(): Promise<void> {
   async function startWorkflow(
     workflowType: string,
     workflowId: string,
-    args: unknown[]
+    args: unknown[],
+    opts?: { rejectDuplicate?: boolean }
   ): Promise<void> {
     try {
       await client.workflow.start(workflowType, {
         taskQueue: TASK_QUEUE,
         workflowId,
         args,
+        ...(opts?.rejectDuplicate && {
+          workflowIdReusePolicy:
+            WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+        }),
       });
       console.log(`Started workflow: ${workflowType} (${workflowId})`);
     } catch (err) {
@@ -129,7 +137,8 @@ async function startPoller(): Promise<void> {
           await startWorkflow(
             "prFeedbackWorkflow",
             `pr-feedback-${pr.number}-${c.id}`,
-            [prComment, BASE_BRANCH]
+            [prComment, BASE_BRANCH],
+            { rejectDuplicate: true }
           );
         }
       }
