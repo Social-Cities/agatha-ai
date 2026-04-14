@@ -14,7 +14,9 @@
     ]
   },
   "include": [
-    "worker.ts"
+    "worker.ts",
+    "shared.ts",
+    "temporal/**/*.ts"
   ],
   "exclude": [
     "dist",
