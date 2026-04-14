@@ -393,6 +393,17 @@ Before finishing:
   A file-by-file breakdown of what was changed and why.
   ## Risks & Notes
   Any risks, edge cases, or things the reviewer should pay attention to.
+
+## PR Description Updates
+If the feedback asks you to update the PR description (title, body, or summary) rather than
+change code, write a file called ".ai-pr-update.md" at the repo root. The file format is:
+
+TITLE: <new PR title, or leave blank to keep the current title>
+
+<new PR body in markdown>
+
+Only write this file when the feedback is specifically about the PR description, not code.
+You may write both code changes AND a PR description update if the feedback asks for both.
 `.trim();
 }
 
@@ -975,16 +986,53 @@ export async function processPRComment(
   try {
     await runClaude(prompt, workDir, options);
 
+    // Check for PR description update
+    const prUpdatePath = path.join(workDir, ".ai-pr-update.md");
+    let prUpdated = false;
+    try {
+      const prUpdateContent = fs.readFileSync(prUpdatePath, "utf8");
+      const titleMatch = prUpdateContent.match(/^TITLE:\s*(.*)$/m);
+      const newTitle = titleMatch?.[1]?.trim() || undefined;
+      const bodyStart = prUpdateContent.indexOf("\n", prUpdateContent.indexOf("TITLE:"));
+      const newBody = bodyStart >= 0 ? prUpdateContent.slice(bodyStart + 1).trim() : undefined;
+
+      const updatePayload: Record<string, string> = {};
+      if (newTitle) updatePayload.title = newTitle;
+      if (newBody) updatePayload.body = newBody;
+
+      if (Object.keys(updatePayload).length > 0) {
+        await octokit.pulls.update({
+          owner: OWNER!,
+          repo: REPO!,
+          pull_number: prNumber,
+          ...updatePayload,
+        });
+        prUpdated = true;
+      }
+
+      fs.unlinkSync(prUpdatePath);
+    } catch {
+      // No PR update file — that's fine
+    }
+
     const diffCheck = await runCommand(
       "git",
       ["status", "--porcelain"],
       workDir
     );
-    if (!diffCheck.stdout.trim()) {
+    const hasCodeChanges = !!diffCheck.stdout.trim();
+
+    if (!hasCodeChanges && !prUpdated) {
       await comment(
         prNumber,
         `⚠️ I reviewed the feedback but found no code changes were needed.`
       );
+      return;
+    }
+
+    if (!hasCodeChanges && prUpdated) {
+      await comment(prNumber, `✅ I've updated the PR description.`);
+      await reactToComment(id, "rocket");
       return;
     }
 
@@ -1019,8 +1067,13 @@ export async function processPRComment(
     );
     await runCommand("git", ["push", "origin", prBranch], workDir);
 
-    const responseBody = [
+    const responseParts = [
       `✅ I've pushed changes to address your feedback.`,
+    ];
+    if (prUpdated) {
+      responseParts.push("I also updated the PR description.");
+    }
+    responseParts.push(
       "",
       aiSummary || "_No detailed summary was generated. Review the diff below._",
       "",
@@ -1028,10 +1081,10 @@ export async function processPRComment(
       "",
       "```",
       diffStat.stdout.trim(),
-      "```",
-    ].join("\n");
+      "```"
+    );
 
-    await comment(prNumber, responseBody);
+    await comment(prNumber, responseParts.join("\n"));
     await reactToComment(id, "rocket");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
