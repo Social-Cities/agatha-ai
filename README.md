@@ -140,6 +140,73 @@ Each generated PR includes:
 - **Risks & notes** — edge cases or things to watch for during review
 
 
+## Temporal Mode (Alternative)
+
+Instead of the built-in poll-and-dispatch loop, you can run Agatha on top of [Temporal.io](https://temporal.io/) for durable execution, crash recovery, built-in retry, and a web UI for monitoring running jobs.
+
+### Prerequisites
+
+Everything from the standard setup, plus:
+
+- **Temporal CLI** — `brew install temporal`
+
+### Quick Start
+
+```bash
+# Terminal 1 — start a local Temporal dev server
+temporal server start-dev
+```
+
+This starts the Temporal server on `localhost:7233` and a Web UI at [http://localhost:8233](http://localhost:8233).
+
+```bash
+# Terminal 2 — start the Temporal worker (executes workflows and activities)
+npm run temporal:dev:worker
+
+# Terminal 3 — start the GitHub poller (detects work and starts workflows)
+npm run temporal:dev:poller
+```
+
+### How It Works
+
+The Temporal mode splits the original worker into two processes:
+
+1. **Poller** (`temporal/start.ts`) — polls GitHub for labeled issues and `/agatha` comments, then starts Temporal workflow executions with deterministic IDs (e.g. `plan-42`, `issue-42`). Temporal deduplicates by workflow ID, so no in-memory tracking is needed.
+
+2. **Worker** (`temporal/worker.ts`) — runs the Temporal Worker which executes workflows and activities. Each job (plan, implement, PR feedback) is a workflow that creates a git worktree, runs Claude, and cleans up. Long-running Claude activities heartbeat every 30 seconds so Temporal can detect stalls.
+
+### Configuration
+
+Add these to your `.env` (all optional — defaults shown):
+
+| Variable | Default | Description |
+|---|---|---|
+| `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal server gRPC address |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace |
+| `TEMPORAL_TASK_QUEUE` | `agatha-github` | Task queue name |
+
+The standard variables (`GITHUB_TOKEN`, `REPO_PATH`, `MAX_CONCURRENT`, etc.) are shared between both modes.
+
+### Monitoring
+
+Open [http://localhost:8233](http://localhost:8233) to see the Temporal Web UI. From there you can:
+
+- View running and completed workflows
+- Inspect workflow history and activity inputs/outputs
+- Terminate or cancel stuck workflows
+- Search workflows by ID or type
+
+### Production with PM2
+
+```bash
+npm run build
+pm2 start ecosystem.config.js
+```
+
+This starts the Temporal worker and poller as PM2 processes alongside or instead of the standard worker (see `ecosystem.config.js`).
+
+> **Note:** Do not run the standard worker and Temporal mode simultaneously — they use the same worktree directory and will conflict.
+
 # Running on mac as a persistent worker
 
 To setup an install

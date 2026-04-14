@@ -8,10 +8,19 @@
     "build": "tsc",
     "start": "node dist/worker.js",
     "dev": "tsx worker.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "temporal:worker": "node dist/temporal/worker.js",
+    "temporal:poller": "node dist/temporal/start.js",
+    "temporal:dev:worker": "tsx temporal/worker.ts",
+    "temporal:dev:poller": "tsx temporal/start.ts"
   },
   "dependencies": {
     "@octokit/rest": "^22.0.0",
+    "@temporalio/activity": "^1.11.0",
+    "@temporalio/client": "^1.11.0",
+    "@temporalio/common": "^1.11.0",
+    "@temporalio/worker": "^1.11.0",
+    "@temporalio/workflow": "^1.11.0",
     "dotenv": "^17.4.0"
   },
   "devDependencies": {
