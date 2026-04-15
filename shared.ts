@@ -103,6 +103,25 @@ export function runCommand(
   });
 }
 
+function formatPromptForComment(prompt: string): string {
+  const truncated = prompt.length > 8000 ? prompt.slice(0, 8000) + "\n\n…(truncated)" : prompt;
+  return [
+    "",
+    "<details>",
+    "<summary>Prompt (for manual run)</summary>",
+    "",
+    "```",
+    truncated,
+    "```",
+    "",
+    "Run manually with:",
+    "```bash",
+    'echo \'<prompt>\' | claude --permission-mode acceptEdits',
+    "```",
+    "</details>",
+  ].join("\n");
+}
+
 export function runClaude(
   prompt: string,
   cwd: string,
@@ -655,7 +674,7 @@ export async function processPlanIssue(
     const message = error instanceof Error ? error.message : String(error);
     await comment(
       issueNumber,
-      `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+      `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
     await removeLabel(issueNumber, "ai-planning");
     await addLabel(issueNumber, "ai-failed");
@@ -718,7 +737,7 @@ export async function processPlanFeedback(
     const message = error instanceof Error ? error.message : String(error);
     await comment(
       issueNumber,
-      `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+      `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
   }
 }
@@ -883,7 +902,7 @@ export async function processIssue(
     const message = error instanceof Error ? error.message : String(error);
     await comment(
       issueNumber,
-      `❌ Failed while processing this task.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+      `❌ Failed while processing this task.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
     await markFailed(issueNumber);
   }
@@ -1015,7 +1034,7 @@ export async function processPRComment(
     const message = error instanceof Error ? error.message : String(error);
     await comment(
       prNumber,
-      `❌ Failed while addressing feedback.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\``
+      `❌ Failed while addressing feedback.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
   }
 }

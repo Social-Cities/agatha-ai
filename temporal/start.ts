@@ -100,7 +100,8 @@ async function startPoller(): Promise<void> {
           await startWorkflow(
             "planFeedbackWorkflow",
             `plan-feedback-${issue.number}-${c.id}`,
-            [issueComment, BASE_BRANCH]
+            [issueComment, BASE_BRANCH],
+            { rejectDuplicate: true }
           );
         }
       }
