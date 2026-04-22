@@ -16,6 +16,21 @@ export type IssueLike = {
   body: string | null;
 };
 
+export type RepoConfig = {
+  owner: string;
+  repo: string;
+  path: string;
+  baseBranch: string;
+  token?: string;
+};
+
+export type RepoContext = {
+  config: RepoConfig;
+  octokit: Octokit;
+  worktreeDir: string;
+  key: string;
+};
+
 export type PRComment = {
   id: number;
   prNumber: number;
@@ -37,24 +52,82 @@ export type IssueComment = {
 /*  Configuration                                                      */
 /* ------------------------------------------------------------------ */
 
-export const octokit = new Octokit({
-  auth: process.env.GITHUB_TOKEN,
-});
-
-export const OWNER = process.env.GITHUB_OWNER;
-export const REPO = process.env.GITHUB_REPO;
-export const REPO_PATH = process.env.REPO_PATH;
-export const BASE_BRANCH = process.env.BASE_BRANCH || "main";
 export const POLL_MS = Number(process.env.POLL_MS || 30000);
 export const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 3);
-export const WORKTREE_DIR = path.join(REPO_PATH!, "..", ".ai-worktrees");
 export const COMMENT_PREFIX = "/agatha";
 
-if (!process.env.GITHUB_TOKEN) {
-  throw new Error("Missing GITHUB_TOKEN");
+const DEFAULT_GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
+export function loadRepoConfigs(): RepoConfig[] {
+  const configPath =
+    process.env.REPOS_CONFIG_PATH || path.resolve(process.cwd(), "repos.json");
+
+  if (!fs.existsSync(configPath)) {
+    throw new Error(
+      `Repos config not found at ${configPath}. Create repos.json or set REPOS_CONFIG_PATH.`
+    );
+  }
+
+  const raw = fs.readFileSync(configPath, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `Failed to parse ${configPath}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(
+      `${configPath} must be a non-empty JSON array of repo configs.`
+    );
+  }
+
+  const configs: RepoConfig[] = [];
+  for (const entry of parsed) {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      typeof (entry as any).owner !== "string" ||
+      typeof (entry as any).repo !== "string" ||
+      typeof (entry as any).path !== "string"
+    ) {
+      throw new Error(
+        `Each repo config must have string "owner", "repo", and "path". Got: ${JSON.stringify(entry)}`
+      );
+    }
+    const e = entry as any;
+    if (!path.isAbsolute(e.path)) {
+      throw new Error(
+        `Repo "${e.owner}/${e.repo}" path must be absolute: ${e.path}`
+      );
+    }
+    configs.push({
+      owner: e.owner,
+      repo: e.repo,
+      path: e.path,
+      baseBranch: typeof e.baseBranch === "string" ? e.baseBranch : "main",
+      token: typeof e.token === "string" ? e.token : undefined,
+    });
+  }
+
+  return configs;
 }
-if (!OWNER || !REPO || !REPO_PATH) {
-  throw new Error("Missing GITHUB_OWNER, GITHUB_REPO, or REPO_PATH");
+
+export function createRepoContext(config: RepoConfig): RepoContext {
+  const token = config.token || DEFAULT_GITHUB_TOKEN;
+  if (!token) {
+    throw new Error(
+      `No GitHub token available for ${config.owner}/${config.repo}. Set GITHUB_TOKEN or add a "token" field to the repo entry.`
+    );
+  }
+  return {
+    config,
+    octokit: new Octokit({ auth: token }),
+    worktreeDir: path.join(config.path, "..", ".ai-worktrees"),
+    key: `${config.owner}/${config.repo}`,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -239,32 +312,31 @@ export function detectPlanAgent(labels: string[]): PlanAgent {
 /*  Git worktree helpers                                               */
 /* ------------------------------------------------------------------ */
 
-export function worktreePath(name: string): string {
-  return path.join(WORKTREE_DIR, name);
+export function worktreePath(ctx: RepoContext, name: string): string {
+  return path.join(ctx.worktreeDir, name);
 }
 
 export async function createWorktree(
+  ctx: RepoContext,
   name: string,
   ref: string,
   newBranch?: string
 ): Promise<string> {
-  const wtPath = worktreePath(name);
+  const wtPath = worktreePath(ctx, name);
 
-  // Prune stale worktree references (e.g. from a previous crash)
-  await runCommand("git", ["worktree", "prune"], REPO_PATH!);
+  await runCommand("git", ["worktree", "prune"], ctx.config.path);
 
-  // Force-remove if this worktree already exists
   try {
     await runCommand(
       "git",
       ["worktree", "remove", "--force", wtPath],
-      REPO_PATH!
+      ctx.config.path
     );
   } catch {
     // Doesn't exist — that's fine
   }
 
-  fs.mkdirSync(WORKTREE_DIR, { recursive: true });
+  fs.mkdirSync(ctx.worktreeDir, { recursive: true });
 
   const args = ["worktree", "add"];
   if (newBranch) {
@@ -274,32 +346,35 @@ export async function createWorktree(
   }
   args.push(wtPath, ref);
 
-  await runCommand("git", args, REPO_PATH!);
+  await runCommand("git", args, ctx.config.path);
   return wtPath;
 }
 
-export async function removeWorktree(name: string): Promise<void> {
+export async function removeWorktree(
+  ctx: RepoContext,
+  name: string
+): Promise<void> {
   try {
     await runCommand(
       "git",
-      ["worktree", "remove", "--force", worktreePath(name)],
-      REPO_PATH!
+      ["worktree", "remove", "--force", worktreePath(ctx, name)],
+      ctx.config.path
     );
   } catch {
     // Ignore — may already be gone
   }
 }
 
-export async function cleanupWorktrees(): Promise<void> {
-  await runCommand("git", ["worktree", "prune"], REPO_PATH!);
+export async function cleanupWorktrees(ctx: RepoContext): Promise<void> {
+  await runCommand("git", ["worktree", "prune"], ctx.config.path);
   try {
-    const entries = fs.readdirSync(WORKTREE_DIR);
+    const entries = fs.readdirSync(ctx.worktreeDir);
     for (const entry of entries) {
       try {
         await runCommand(
           "git",
-          ["worktree", "remove", "--force", path.join(WORKTREE_DIR, entry)],
-          REPO_PATH!
+          ["worktree", "remove", "--force", path.join(ctx.worktreeDir, entry)],
+          ctx.config.path
         );
       } catch {
         // Ignore
@@ -504,20 +579,28 @@ Write the updated plan to ".ai-plan.md" at the repo root, keeping the same secti
 /*  GitHub helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-export async function addLabel(issueNumber: number, label: string): Promise<void> {
-  await octokit.issues.addLabels({
-    owner: OWNER!,
-    repo: REPO!,
+export async function addLabel(
+  ctx: RepoContext,
+  issueNumber: number,
+  label: string
+): Promise<void> {
+  await ctx.octokit.issues.addLabels({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     issue_number: issueNumber,
     labels: [label],
   });
 }
 
-export async function removeLabel(issueNumber: number, label: string): Promise<void> {
+export async function removeLabel(
+  ctx: RepoContext,
+  issueNumber: number,
+  label: string
+): Promise<void> {
   try {
-    await octokit.issues.removeLabel({
-      owner: OWNER!,
-      repo: REPO!,
+    await ctx.octokit.issues.removeLabel({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       issue_number: issueNumber,
       name: label,
     });
@@ -526,41 +609,55 @@ export async function removeLabel(issueNumber: number, label: string): Promise<v
   }
 }
 
-export async function comment(issueNumber: number, body: string): Promise<void> {
-  await octokit.issues.createComment({
-    owner: OWNER!,
-    repo: REPO!,
+export async function comment(
+  ctx: RepoContext,
+  issueNumber: number,
+  body: string
+): Promise<void> {
+  await ctx.octokit.issues.createComment({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     issue_number: issueNumber,
     body,
   });
 }
 
 export async function reactToComment(
+  ctx: RepoContext,
   commentId: number,
   reaction: "+1" | "eyes" | "rocket"
 ): Promise<void> {
-  await octokit.reactions.createForIssueComment({
-    owner: OWNER!,
-    repo: REPO!,
+  await ctx.octokit.reactions.createForIssueComment({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     comment_id: commentId,
     content: reaction,
   });
 }
 
-export async function markInProgress(issueNumber: number): Promise<void> {
-  await addLabel(issueNumber, "ai-running");
-  await removeLabel(issueNumber, "ai-task");
-  await removeLabel(issueNumber, "ai-failed");
+export async function markInProgress(
+  ctx: RepoContext,
+  issueNumber: number
+): Promise<void> {
+  await addLabel(ctx, issueNumber, "ai-running");
+  await removeLabel(ctx, issueNumber, "ai-task");
+  await removeLabel(ctx, issueNumber, "ai-failed");
 }
 
-export async function markFailed(issueNumber: number): Promise<void> {
-  await addLabel(issueNumber, "ai-failed");
-  await removeLabel(issueNumber, "ai-running");
+export async function markFailed(
+  ctx: RepoContext,
+  issueNumber: number
+): Promise<void> {
+  await addLabel(ctx, issueNumber, "ai-failed");
+  await removeLabel(ctx, issueNumber, "ai-running");
 }
 
-export async function markDone(issueNumber: number): Promise<void> {
-  await addLabel(issueNumber, "ai-done");
-  await removeLabel(issueNumber, "ai-running");
+export async function markDone(
+  ctx: RepoContext,
+  issueNumber: number
+): Promise<void> {
+  await addLabel(ctx, issueNumber, "ai-done");
+  await removeLabel(ctx, issueNumber, "ai-running");
 }
 
 /* ------------------------------------------------------------------ */
@@ -584,10 +681,13 @@ export function extractPlanFromComment(body: string): string {
   return planEnd > planStart ? body.slice(planStart, planEnd) : body.slice(planStart);
 }
 
-export async function findLatestPlan(issueNumber: number): Promise<string> {
-  const comments = await octokit.issues.listComments({
-    owner: OWNER!,
-    repo: REPO!,
+export async function findLatestPlan(
+  ctx: RepoContext,
+  issueNumber: number
+): Promise<string> {
+  const comments = await ctx.octokit.issues.listComments({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     issue_number: issueNumber,
     per_page: 100,
   });
@@ -606,11 +706,12 @@ export async function findLatestPlan(issueNumber: number): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 export async function getPendingPlanComments(
+  ctx: RepoContext,
   processedCommentIds: Set<number>
 ): Promise<IssueComment[]> {
-  const issues = await octokit.issues.listForRepo({
-    owner: OWNER!,
-    repo: REPO!,
+  const issues = await ctx.octokit.issues.listForRepo({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     state: "open",
     labels: "ai-planned",
     per_page: 50,
@@ -621,9 +722,9 @@ export async function getPendingPlanComments(
   for (const issue of issues.data) {
     if ("pull_request" in issue && issue.pull_request) continue;
 
-    const comments = await octokit.issues.listComments({
-      owner: OWNER!,
-      repo: REPO!,
+    const comments = await ctx.octokit.issues.listComments({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       issue_number: issue.number,
       per_page: 100,
     });
@@ -652,11 +753,12 @@ export async function getPendingPlanComments(
 }
 
 export async function getPendingPRComments(
+  ctx: RepoContext,
   processedCommentIds: Set<number>
 ): Promise<PRComment[]> {
-  const pulls = await octokit.pulls.list({
-    owner: OWNER!,
-    repo: REPO!,
+  const pulls = await ctx.octokit.pulls.list({
+    owner: ctx.config.owner,
+    repo: ctx.config.repo,
     state: "open",
     per_page: 50,
   });
@@ -664,9 +766,9 @@ export async function getPendingPRComments(
   const pending: PRComment[] = [];
 
   for (const pr of pulls.data) {
-    const comments = await octokit.issues.listComments({
-      owner: OWNER!,
-      repo: REPO!,
+    const comments = await ctx.octokit.issues.listComments({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       issue_number: pr.number,
       per_page: 100,
     });
@@ -696,6 +798,7 @@ export async function getPendingPRComments(
 /* ------------------------------------------------------------------ */
 
 export async function processPlanIssue(
+  ctx: RepoContext,
   issue: IssueLike,
   workDir: string,
   options?: { onHeartbeat?: () => void; agent?: PlanAgent }
@@ -705,10 +808,11 @@ export async function processPlanIssue(
   const agent = options?.agent ?? "claude";
   const agentName = agent === "codex" ? "Codex" : "Claude";
 
-  await addLabel(issueNumber, "ai-planning");
-  await removeLabel(issueNumber, "ai-plan");
+  await addLabel(ctx, issueNumber, "ai-planning");
+  await removeLabel(ctx, issueNumber, "ai-plan");
 
   await comment(
+    ctx,
     issueNumber,
     `🤖 Creating an implementation plan using ${agentName}…`
   );
@@ -733,20 +837,22 @@ export async function processPlanIssue(
     }
 
     await comment(
+      ctx,
       issueNumber,
       `## 📋 Implementation Plan\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan, or add the \`ai-task\` label to start implementation._`
     );
 
-    await removeLabel(issueNumber, "ai-planning");
-    await addLabel(issueNumber, "ai-planned");
+    await removeLabel(ctx, issueNumber, "ai-planning");
+    await addLabel(ctx, issueNumber, "ai-planned");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await comment(
+      ctx,
       issueNumber,
       `❌ Failed while creating plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
-    await removeLabel(issueNumber, "ai-planning");
-    await addLabel(issueNumber, "ai-failed");
+    await removeLabel(ctx, issueNumber, "ai-planning");
+    await addLabel(ctx, issueNumber, "ai-failed");
   }
 }
 
@@ -755,6 +861,7 @@ export async function processPlanIssue(
 /* ------------------------------------------------------------------ */
 
 export async function processPlanFeedback(
+  ctx: RepoContext,
   issueComment: IssueComment,
   workDir: string,
   options?: { onHeartbeat?: () => void; agent?: PlanAgent }
@@ -763,16 +870,18 @@ export async function processPlanFeedback(
   const agent = options?.agent ?? "claude";
   const agentName = agent === "codex" ? "Codex" : "Claude";
 
-  await reactToComment(id, "eyes");
+  await reactToComment(ctx, id, "eyes");
   await comment(
+    ctx,
     issueNumber,
     `🤖 Revising the plan using ${agentName} based on your feedback…\n\n> ${body.split("\n")[0]}`
   );
 
-  const currentPlan = await findLatestPlan(issueNumber);
+  const currentPlan = await findLatestPlan(ctx, issueNumber);
 
   if (!currentPlan) {
     await comment(
+      ctx,
       issueNumber,
       `⚠️ Could not find an existing plan to revise. Add the \`ai-plan\` label to generate one first.`
     );
@@ -804,13 +913,15 @@ export async function processPlanFeedback(
     }
 
     await comment(
+      ctx,
       issueNumber,
       `## 📋 Implementation Plan (Revised)\n\n${plan}\n\n---\n_Comment \`/agatha <your feedback>\` to revise this plan further, or add the \`ai-task\` label to start implementation._`
     );
-    await reactToComment(id, "rocket");
+    await reactToComment(ctx, id, "rocket");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await comment(
+      ctx,
       issueNumber,
       `❌ Failed while revising plan.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
@@ -822,6 +933,7 @@ export async function processPlanFeedback(
 /* ------------------------------------------------------------------ */
 
 export async function processIssue(
+  ctx: RepoContext,
   issue: IssueLike,
   workDir: string,
   options?: { onHeartbeat?: () => void }
@@ -829,14 +941,15 @@ export async function processIssue(
   const { number: issueNumber, title: issueTitle, body } = issue;
   const issueBody = body || "";
   const branch = safeBranchName(issueNumber);
+  const baseBranch = ctx.config.baseBranch;
 
-  await markInProgress(issueNumber);
-  await removeLabel(issueNumber, "ai-planned");
+  await markInProgress(ctx, issueNumber);
+  await removeLabel(ctx, issueNumber, "ai-planned");
 
-  // Check if there's an existing plan from the ai-plan workflow
-  const existingPlan = await findLatestPlan(issueNumber);
+  const existingPlan = await findLatestPlan(ctx, issueNumber);
 
   await comment(
+    ctx,
     issueNumber,
     existingPlan
       ? `🤖 Starting work on \`${branch}\` using the approved plan.`
@@ -862,7 +975,6 @@ export async function processIssue(
       throw new Error("Claude completed, but no file changes were detected.");
     }
 
-    // Read the AI summary if it was generated
     const summaryPath = path.join(workDir, ".ai-summary.md");
     let aiSummary = "";
     try {
@@ -871,17 +983,15 @@ export async function processIssue(
       // Summary wasn't created — we'll build a minimal one from the diff
     }
 
-    // Get diff stats for the PR description
     const diffStat = await runCommand(
       "git",
-      ["diff", "--stat", BASE_BRANCH],
+      ["diff", "--stat", baseBranch],
       workDir
     );
 
-    // Find migration files and read their contents
     const diffFiles = await runCommand(
       "git",
-      ["diff", "--name-only", BASE_BRANCH],
+      ["diff", "--name-only", baseBranch],
       workDir
     );
     const changedFiles = diffFiles.stdout.trim().split("\n").filter(Boolean);
@@ -908,7 +1018,6 @@ export async function processIssue(
       }
     }
 
-    // Remove the summary file before committing
     try {
       fs.unlinkSync(summaryPath);
     } catch {
@@ -958,7 +1067,7 @@ export async function processIssue(
         "--body-file",
         prBodyFile,
         "--base",
-        BASE_BRANCH,
+        baseBranch,
         "--head",
         branch,
       ],
@@ -971,15 +1080,16 @@ export async function processIssue(
       // Ignore cleanup failure.
     }
 
-    await comment(issueNumber, `✅ PR created:\n\n${pr.stdout}`);
-    await markDone(issueNumber);
+    await comment(ctx, issueNumber, `✅ PR created:\n\n${pr.stdout}`);
+    await markDone(ctx, issueNumber);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await comment(
+      ctx,
       issueNumber,
       `❌ Failed while processing this task.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );
-    await markFailed(issueNumber);
+    await markFailed(ctx, issueNumber);
   }
 }
 
@@ -988,14 +1098,16 @@ export async function processIssue(
 /* ------------------------------------------------------------------ */
 
 export async function processPRComment(
+  ctx: RepoContext,
   prComment: PRComment,
   workDir: string,
   options?: { onHeartbeat?: () => void }
 ): Promise<void> {
   const { id, prNumber, prTitle, prBranch, body } = prComment;
 
-  await reactToComment(id, "eyes");
+  await reactToComment(ctx, id, "eyes");
   await comment(
+    ctx,
     prNumber,
     `🤖 Working on your feedback…\n\n> ${body.split("\n")[0]}`
   );
@@ -1005,7 +1117,6 @@ export async function processPRComment(
   try {
     await runClaude(prompt, workDir, options);
 
-    // Check for PR description update
     const prUpdatePath = path.join(workDir, ".ai-pr-update.md");
     let prUpdated = false;
     try {
@@ -1020,9 +1131,9 @@ export async function processPRComment(
       if (newBody) updatePayload.body = newBody;
 
       if (Object.keys(updatePayload).length > 0) {
-        await octokit.pulls.update({
-          owner: OWNER!,
-          repo: REPO!,
+        await ctx.octokit.pulls.update({
+          owner: ctx.config.owner,
+          repo: ctx.config.repo,
           pull_number: prNumber,
           ...updatePayload,
         });
@@ -1043,6 +1154,7 @@ export async function processPRComment(
 
     if (!hasCodeChanges && !prUpdated) {
       await comment(
+        ctx,
         prNumber,
         `⚠️ I reviewed the feedback but found no code changes were needed.`
       );
@@ -1050,12 +1162,11 @@ export async function processPRComment(
     }
 
     if (!hasCodeChanges && prUpdated) {
-      await comment(prNumber, `✅ I've updated the PR description.`);
-      await reactToComment(id, "rocket");
+      await comment(ctx, prNumber, `✅ I've updated the PR description.`);
+      await reactToComment(ctx, id, "rocket");
       return;
     }
 
-    // Read the AI summary if it was generated
     const summaryPath = path.join(workDir, ".ai-summary.md");
     let aiSummary = "";
     try {
@@ -1064,14 +1175,12 @@ export async function processPRComment(
       // Summary wasn't created
     }
 
-    // Remove the summary file before committing
     try {
       fs.unlinkSync(summaryPath);
     } catch {
       // Ignore
     }
 
-    // Get diff stats
     const diffStat = await runCommand(
       "git",
       ["diff", "--stat", `origin/${prBranch}`],
@@ -1103,11 +1212,12 @@ export async function processPRComment(
       "```"
     );
 
-    await comment(prNumber, responseParts.join("\n"));
-    await reactToComment(id, "rocket");
+    await comment(ctx, prNumber, responseParts.join("\n"));
+    await reactToComment(ctx, id, "rocket");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await comment(
+      ctx,
       prNumber,
       `❌ Failed while addressing feedback.\n\n\`\`\`\n${message.slice(0, 6000)}\n\`\`\`${formatPromptForComment(prompt)}`
     );

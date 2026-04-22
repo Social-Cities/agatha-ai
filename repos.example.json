@@ -1,0 +1,15 @@
+[
+  {
+    "owner": "your-org",
+    "repo": "your-repo-one",
+    "path": "/Users/yourname/code/your-repo-one",
+    "baseBranch": "main"
+  },
+  {
+    "owner": "another-org",
+    "repo": "another-repo",
+    "path": "/Users/yourname/code/another-repo",
+    "baseBranch": "develop",
+    "token": "ghp_optional_override_token_for_this_repo"
+  }
+]

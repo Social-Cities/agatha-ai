@@ -5,24 +5,29 @@ import {
   WorkflowIdReusePolicy,
 } from "@temporalio/common";
 import {
-  octokit,
-  OWNER,
-  REPO,
-  BASE_BRANCH,
+  loadRepoConfigs,
+  createRepoContext,
   POLL_MS,
   COMMENT_PREFIX,
   safeBranchName,
   cleanupWorktrees,
   runCommand,
-  REPO_PATH,
 } from "../shared";
-import type { IssueLike, IssueComment, PRComment } from "../shared";
+import type {
+  IssueLike,
+  IssueComment,
+  PRComment,
+  RepoContext,
+} from "../shared";
 
 const TASK_QUEUE = process.env.TEMPORAL_TASK_QUEUE || "agatha-github";
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || "localhost:7233";
 const TEMPORAL_NAMESPACE = process.env.TEMPORAL_NAMESPACE || "default";
 
 async function startPoller(): Promise<void> {
+  const configs = loadRepoConfigs();
+  const contexts = configs.map(createRepoContext);
+
   const connection = await Connection.connect({ address: TEMPORAL_ADDRESS });
   const client = new Client({
     connection,
@@ -32,12 +37,15 @@ async function startPoller(): Promise<void> {
   console.log(
     `Temporal poller started — polling every ${POLL_MS}ms, queue "${TASK_QUEUE}"`
   );
+  console.log(`Watching ${contexts.length} repo(s):`);
+  for (const ctx of contexts) {
+    console.log(`  - ${ctx.key} @ ${ctx.config.path} (base: ${ctx.config.baseBranch})`);
+  }
 
-  // Clean up any leftover worktrees from a previous run
-  await cleanupWorktrees();
-
-  // Ensure main repo is on the base branch
-  await runCommand("git", ["checkout", BASE_BRANCH], REPO_PATH!);
+  for (const ctx of contexts) {
+    await cleanupWorktrees(ctx);
+    await runCommand("git", ["checkout", ctx.config.baseBranch], ctx.config.path);
+  }
 
   async function startWorkflow(
     workflowType: string,
@@ -65,11 +73,13 @@ async function startPoller(): Promise<void> {
     }
   }
 
-  async function poll(): Promise<void> {
+  async function pollRepo(ctx: RepoContext): Promise<void> {
+    const workflowIdPrefix = `${ctx.config.owner}-${ctx.config.repo}`;
+
     // 1. Plan feedback comments (on ai-planned issues)
-    const planIssues = await octokit.issues.listForRepo({
-      owner: OWNER!,
-      repo: REPO!,
+    const planIssues = await ctx.octokit.issues.listForRepo({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       state: "open",
       labels: "ai-planned",
       per_page: 50,
@@ -78,9 +88,9 @@ async function startPoller(): Promise<void> {
     for (const issue of planIssues.data) {
       if ("pull_request" in issue && issue.pull_request) continue;
 
-      const comments = await octokit.issues.listComments({
-        owner: OWNER!,
-        repo: REPO!,
+      const comments = await ctx.octokit.issues.listComments({
+        owner: ctx.config.owner,
+        repo: ctx.config.repo,
         issue_number: issue.number,
         per_page: 100,
       });
@@ -90,10 +100,7 @@ async function startPoller(): Promise<void> {
       );
 
       for (const c of comments.data) {
-        if (
-          c.body &&
-          c.body.trimStart().startsWith(COMMENT_PREFIX)
-        ) {
+        if (c.body && c.body.trimStart().startsWith(COMMENT_PREFIX)) {
           const issueComment: IssueComment = {
             id: c.id,
             issueNumber: issue.number,
@@ -104,8 +111,8 @@ async function startPoller(): Promise<void> {
           };
           await startWorkflow(
             "planFeedbackWorkflow",
-            `plan-feedback-${issue.number}-${c.id}`,
-            [issueComment, BASE_BRANCH],
+            `${workflowIdPrefix}-plan-feedback-${issue.number}-${c.id}`,
+            [ctx.config, issueComment],
             { rejectDuplicate: true }
           );
         }
@@ -113,26 +120,23 @@ async function startPoller(): Promise<void> {
     }
 
     // 2. PR feedback comments
-    const pulls = await octokit.pulls.list({
-      owner: OWNER!,
-      repo: REPO!,
+    const pulls = await ctx.octokit.pulls.list({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       state: "open",
       per_page: 50,
     });
 
     for (const pr of pulls.data) {
-      const comments = await octokit.issues.listComments({
-        owner: OWNER!,
-        repo: REPO!,
+      const comments = await ctx.octokit.issues.listComments({
+        owner: ctx.config.owner,
+        repo: ctx.config.repo,
         issue_number: pr.number,
         per_page: 100,
       });
 
       for (const c of comments.data) {
-        if (
-          c.body &&
-          c.body.trimStart().startsWith(COMMENT_PREFIX)
-        ) {
+        if (c.body && c.body.trimStart().startsWith(COMMENT_PREFIX)) {
           const prComment: PRComment = {
             id: c.id,
             prNumber: pr.number,
@@ -142,8 +146,8 @@ async function startPoller(): Promise<void> {
           };
           await startWorkflow(
             "prFeedbackWorkflow",
-            `pr-feedback-${pr.number}-${c.id}`,
-            [prComment, BASE_BRANCH],
+            `${workflowIdPrefix}-pr-feedback-${pr.number}-${c.id}`,
+            [ctx.config, prComment],
             { rejectDuplicate: true }
           );
         }
@@ -151,9 +155,9 @@ async function startPoller(): Promise<void> {
     }
 
     // 3. Issues needing a plan
-    const plannable = await octokit.issues.listForRepo({
-      owner: OWNER!,
-      repo: REPO!,
+    const plannable = await ctx.octokit.issues.listForRepo({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       state: "open",
       labels: "ai-plan",
       per_page: 20,
@@ -173,15 +177,15 @@ async function startPoller(): Promise<void> {
       };
       await startWorkflow(
         "planIssueWorkflow",
-        `plan-${issue.number}`,
-        [issueLike, BASE_BRANCH]
+        `${workflowIdPrefix}-plan-${issue.number}`,
+        [ctx.config, issueLike]
       );
     }
 
     // 4. Issues ready for implementation
-    const taskable = await octokit.issues.listForRepo({
-      owner: OWNER!,
-      repo: REPO!,
+    const taskable = await ctx.octokit.issues.listForRepo({
+      owner: ctx.config.owner,
+      repo: ctx.config.repo,
       state: "open",
       labels: "ai-task",
       per_page: 20,
@@ -202,13 +206,22 @@ async function startPoller(): Promise<void> {
       const branch = safeBranchName(issue.number);
       await startWorkflow(
         "implementIssueWorkflow",
-        `issue-${issue.number}`,
-        [issueLike, branch, BASE_BRANCH]
+        `${workflowIdPrefix}-issue-${issue.number}`,
+        [ctx.config, issueLike, branch]
       );
     }
   }
 
-  // Start polling
+  async function poll(): Promise<void> {
+    for (const ctx of contexts) {
+      try {
+        await pollRepo(ctx);
+      } catch (error) {
+        console.error(`Poll for ${ctx.key} failed:`, error);
+      }
+    }
+  }
+
   setInterval(() => {
     poll().catch((error) => {
       console.error("Poll loop failed:", error);
