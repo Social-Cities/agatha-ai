@@ -22,6 +22,7 @@ export type RepoConfig = {
   path: string;
   baseBranch: string;
   token?: string;
+  persona?: string;
 };
 
 export type RepoContext = {
@@ -109,6 +110,7 @@ export function loadRepoConfigs(): RepoConfig[] {
       path: e.path,
       baseBranch: typeof e.baseBranch === "string" ? e.baseBranch : "main",
       token: typeof e.token === "string" ? e.token : undefined,
+      persona: typeof e.persona === "string" ? e.persona : undefined,
     });
   }
 
@@ -401,9 +403,20 @@ export function sanitizeCommitMessage(input: string): string {
 /*  Prompt builders                                                    */
 /* ------------------------------------------------------------------ */
 
-export function buildClaudePrompt(issueTitle: string, issueBody: string): string {
+export const DEFAULT_PERSONA =
+  "a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel";
+
+function personaIntro(persona: string | undefined): string {
+  return `You are ${persona || DEFAULT_PERSONA}.`;
+}
+
+export function buildClaudePrompt(
+  issueTitle: string,
+  issueBody: string,
+  persona?: string
+): string {
   return `
-You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+${personaIntro(persona)}
 
 Your task is to implement the GitHub issue below.
 
@@ -447,10 +460,11 @@ Before finishing:
 
 export function buildFeedbackPrompt(
   prTitle: string,
-  feedbackBody: string
+  feedbackBody: string,
+  persona?: string
 ): string {
   return `
-You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+${personaIntro(persona)}
 
 You previously opened a PR with the following title:
 ${prTitle}
@@ -501,9 +515,13 @@ You may write both code changes AND a PR description update if the feedback asks
 `.trim();
 }
 
-export function buildPlanPrompt(issueTitle: string, issueBody: string): string {
+export function buildPlanPrompt(
+  issueTitle: string,
+  issueBody: string,
+  persona?: string
+): string {
   return `
-You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+${personaIntro(persona)}
 
 Your task is to create a detailed implementation plan for the GitHub issue below. Do NOT implement anything — only plan.
 
@@ -545,10 +563,11 @@ export function buildPlanRevisionPrompt(
   issueTitle: string,
   issueBody: string,
   currentPlan: string,
-  feedback: string
+  feedback: string,
+  persona?: string
 ): string {
   return `
-You are a senior TypeScript engineer working in an existing React + TypeScript application deployed on Vercel.
+${personaIntro(persona)}
 
 You previously created an implementation plan for the GitHub issue below. A reviewer has provided feedback on the plan. Update the plan accordingly.
 
@@ -817,7 +836,7 @@ export async function processPlanIssue(
     `🤖 Creating an implementation plan using ${agentName}…`
   );
 
-  const prompt = buildPlanPrompt(issueTitle, issueBody);
+  const prompt = buildPlanPrompt(issueTitle, issueBody, ctx.config.persona);
 
   try {
     if (agent === "codex") {
@@ -892,7 +911,8 @@ export async function processPlanFeedback(
     issueTitle,
     issueBody,
     currentPlan,
-    body
+    body,
+    ctx.config.persona
   );
 
   try {
@@ -959,9 +979,10 @@ export async function processIssue(
   const prompt = existingPlan
     ? buildClaudePrompt(
         issueTitle,
-        issueBody + "\n\n## Approved Implementation Plan\n\n" + existingPlan
+        issueBody + "\n\n## Approved Implementation Plan\n\n" + existingPlan,
+        ctx.config.persona
       )
-    : buildClaudePrompt(issueTitle, issueBody);
+    : buildClaudePrompt(issueTitle, issueBody, ctx.config.persona);
 
   try {
     await runClaude(prompt, workDir, options);
@@ -1112,7 +1133,7 @@ export async function processPRComment(
     `🤖 Working on your feedback…\n\n> ${body.split("\n")[0]}`
   );
 
-  const prompt = buildFeedbackPrompt(prTitle, body);
+  const prompt = buildFeedbackPrompt(prTitle, body, ctx.config.persona);
 
   try {
     await runClaude(prompt, workDir, options);

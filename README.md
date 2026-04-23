@@ -1,15 +1,17 @@
 # Agatha — GitHub Issue Worker
 
-A background worker that monitors a GitHub repository for issues labeled `ai-task`, uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to implement the requested changes, and opens a pull request for review.
+A background worker that monitors one or more GitHub repositories (across multiple organizations) for issues labeled `ai-task`, uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to implement the requested changes, and opens a pull request for review.
 
 ## How It Works
 
-1. The worker polls the GitHub repo for open issues with the `ai-task` label.
-2. When it finds one, it labels the issue `ai-running` and checks out a fresh branch from the base branch.
+1. The worker polls each configured GitHub repo for open issues with the `ai-task` label.
+2. When it finds one, it labels the issue `ai-running` and checks out a fresh branch from that repo's base branch.
 3. It sends the issue title and body to Claude Code, which reads the codebase, plans an approach, implements the changes, and runs validation (build, typecheck, tests).
 4. If Claude produces file changes, the worker commits them, pushes the branch, and opens a PR.
 5. The PR description includes a detailed summary of the approach, a file-by-file changelog, diff stats, and the full SQL content of any database migrations (ready to copy/paste into Supabase).
 6. The issue is labeled `ai-done` on success or `ai-failed` on error (with a comment explaining what went wrong).
+
+Jobs run concurrently (up to `MAX_CONCURRENT`) in isolated git worktrees. When multiple repos have pending work, the dispatcher uses **interleaved round-robin scheduling** — one job from each repo per pass — so no single repo can starve the others.
 
 ## Prerequisites
 
@@ -23,19 +25,57 @@ A background worker that monitors a GitHub repository for issues labeled `ai-tas
 ```bash
 git clone <this-repo> && cd agatha
 npm install
-cp .env.example .env
+cp env.example .env
+cp repos.example.json repos.json
 ```
 
-Edit `.env` with your values:
+### 1. Environment variables
+
+Edit `.env`:
 
 | Variable | Description | Required |
 |---|---|---|
-| `GITHUB_TOKEN` | GitHub personal access token with repo scope | Yes |
-| `GITHUB_OWNER` | Repository owner (user or org) | Yes |
-| `GITHUB_REPO` | Repository name | Yes |
-| `REPO_PATH` | Absolute path to a local clone of the target repo | Yes |
-| `BASE_BRANCH` | Branch to base work off of (default: `main`) | No |
+| `GITHUB_TOKEN` | Default GitHub PAT — used for any repo in `repos.json` that doesn't set its own `token` | Yes* |
+| `REPOS_CONFIG_PATH` | Path to the multi-repo config file (default: `./repos.json`) | No |
 | `POLL_MS` | Polling interval in milliseconds (default: `30000`) | No |
+| `MAX_CONCURRENT` | Max concurrent jobs across all repos (default: `3`) | No |
+
+\* `GITHUB_TOKEN` is optional if every repo in `repos.json` has its own `token` field.
+
+### 2. Multi-repo config (`repos.json`)
+
+`repos.json` is a JSON array listing every repo the worker should watch. Each entry can target a different owner/org, and can optionally override the GitHub token (e.g. if repos live in different organizations and you need a separate PAT for each).
+
+```json
+[
+  {
+    "owner": "your-org",
+    "repo": "your-repo-one",
+    "path": "/Users/yourname/code/your-repo-one",
+    "baseBranch": "main"
+  },
+  {
+    "owner": "another-org",
+    "repo": "another-repo",
+    "path": "/Users/yourname/code/another-repo",
+    "baseBranch": "develop",
+    "token": "ghp_optional_override_token_for_this_repo"
+  }
+]
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `owner` | Yes | GitHub user or org that owns the repo |
+| `repo` | Yes | Repo name |
+| `path` | Yes | Absolute path to a local clone of the repo |
+| `baseBranch` | No | Branch to base work off (default: `main`) |
+| `token` | No | Per-repo GitHub PAT; falls back to `GITHUB_TOKEN` if omitted |
+| `persona` | No | Engineer framing for this repo (e.g. `"a senior Go engineer working in a microservices backend"`). Defaults to a TypeScript/React/Vercel persona. Tip: for anything richer than a one-liner, put it in the target repo's `CLAUDE.md` — Claude Code picks that up automatically. |
+
+**Before starting the worker**, make sure each `path` points at a clean clone checked out on its `baseBranch`. The worker creates worktrees under `<path>/../.ai-worktrees/` for each repo, so the main clone stays untouched.
+
+> `repos.json` is gitignored — commit `repos.example.json` if you want to share the schema.
 
 ## Usage
 
@@ -56,11 +96,11 @@ The worker runs in a loop — leave it running and it will pick up new `ai-task`
 
 ## Creating Tasks
 
-1. Open an issue in the target repository.
+1. Open an issue in any repo listed in `repos.json`.
 2. Write a clear title and description of the feature or bug fix.
 3. Add the `ai-task` label.
 
-The worker will pick it up on the next poll cycle.
+The worker will pick it up on the next poll cycle. Jobs are namespaced per repo (`${owner}/${repo}:issue-${number}`), so issues with the same number in different repos never collide.
 
 ### Setting Up an Issue Template
 
@@ -175,6 +215,8 @@ The Temporal mode splits the original worker into two processes:
 
 2. **Worker** (`temporal/worker.ts`) — runs the Temporal Worker which executes workflows and activities. Each job (plan, implement, PR feedback) is a workflow that creates a git worktree, runs Claude, and cleans up. Long-running Claude activities heartbeat every 30 seconds so Temporal can detect stalls.
 
+Both the poller and the worker read `repos.json` at startup and the per-repo config is passed through every workflow and activity, so a single Temporal worker process serves all repos.
+
 ### Configuration
 
 Add these to your `.env` (all optional — defaults shown):
@@ -185,7 +227,7 @@ Add these to your `.env` (all optional — defaults shown):
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace |
 | `TEMPORAL_TASK_QUEUE` | `agatha-github` | Task queue name |
 
-The standard variables (`GITHUB_TOKEN`, `REPO_PATH`, `MAX_CONCURRENT`, etc.) are shared between both modes.
+Temporal mode reads the same `repos.json` as the standard worker. The other shared variables (`GITHUB_TOKEN`, `MAX_CONCURRENT`, `POLL_MS`, `REPOS_CONFIG_PATH`) apply to both modes. Workflow IDs are namespaced per repo (e.g. `your-org-your-repo-issue-42`) so the same issue number in different repos produces distinct workflow executions.
 
 ### Monitoring
 

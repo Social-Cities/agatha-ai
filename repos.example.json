@@ -10,6 +10,7 @@
     "repo": "another-repo",
     "path": "/Users/yourname/code/another-repo",
     "baseBranch": "develop",
-    "token": "ghp_optional_override_token_for_this_repo"
+    "token": "ghp_optional_override_token_for_this_repo",
+    "persona": "a senior Go engineer working in a microservices backend with Postgres and gRPC"
   }
 ]
