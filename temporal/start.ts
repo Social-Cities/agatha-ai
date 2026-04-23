@@ -11,6 +11,7 @@ import {
   COMMENT_PREFIX,
   safeBranchName,
   cleanupWorktrees,
+  ensureRepoCloned,
   runCommand,
 } from "../shared";
 import type {
@@ -43,6 +44,7 @@ async function startPoller(): Promise<void> {
   }
 
   for (const ctx of contexts) {
+    await ensureRepoCloned(ctx);
     await cleanupWorktrees(ctx);
     await runCommand("git", ["checkout", ctx.config.baseBranch], ctx.config.path);
   }

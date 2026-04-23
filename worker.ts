@@ -9,6 +9,7 @@ import {
   createWorktree,
   removeWorktree,
   cleanupWorktrees,
+  ensureRepoCloned,
   safeBranchName,
   getPendingPlanComments,
   getPendingPRComments,
@@ -245,6 +246,7 @@ async function start(): Promise<void> {
   }
 
   for (const ctx of contexts) {
+    await ensureRepoCloned(ctx);
     await cleanupWorktrees(ctx);
     // Ensure main repo is on the base branch so worktree branch creation never conflicts
     await runCommand("git", ["checkout", ctx.config.baseBranch], ctx.config.path);

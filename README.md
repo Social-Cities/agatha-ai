@@ -73,7 +73,9 @@ Edit `.env`:
 | `token` | No | Per-repo GitHub PAT; falls back to `GITHUB_TOKEN` if omitted |
 | `persona` | No | Engineer framing for this repo (e.g. `"a senior Go engineer working in a microservices backend"`). Defaults to a TypeScript/React/Vercel persona. Tip: for anything richer than a one-liner, put it in the target repo's `CLAUDE.md` — Claude Code picks that up automatically. |
 
-**Before starting the worker**, make sure each `path` points at a clean clone checked out on its `baseBranch`. The worker creates worktrees under `<path>/../.ai-worktrees/` for each repo, so the main clone stays untouched.
+**Auto-clone:** if a repo's `path` doesn't exist, the worker clones it for you on startup using the repo's `token` (or the fallback `GITHUB_TOKEN`). The token is embedded only for the clone and then stripped from `.git/config` — subsequent `git fetch` / `git push` use whatever credential setup you already have (`gh auth`, keychain, etc.). If `path` exists but isn't a git repo, the worker errors rather than risk clobbering files.
+
+The worker creates worktrees under `<path>/../.ai-worktrees/` for each repo, so the main clone stays untouched.
 
 > `repos.json` is gitignored — commit `repos.example.json` if you want to share the schema.
 
