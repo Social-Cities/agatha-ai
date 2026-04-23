@@ -1,6 +1,6 @@
 import { proxyActivities } from "@temporalio/workflow";
 import type * as activities from "./activities";
-import type { IssueLike, IssueComment, PRComment } from "../shared";
+import type { IssueLike, IssueComment, PRComment, RepoConfig } from "../shared";
 
 /* ------------------------------------------------------------------ */
 /*  Activity proxies                                                   */
@@ -38,74 +38,78 @@ const {
 /* ------------------------------------------------------------------ */
 
 export async function planIssueWorkflow(
-  issue: IssueLike,
-  baseBranch: string
+  config: RepoConfig,
+  issue: IssueLike
 ): Promise<void> {
   const worktreeName = `plan-${issue.number}`;
-  await gitFetchActivity();
+  await gitFetchActivity(config);
   const workDir = await createWorktreeActivity(
+    config,
     worktreeName,
-    `origin/${baseBranch}`,
+    `origin/${config.baseBranch}`,
     undefined
   );
   try {
-    await processPlanIssueActivity(issue, workDir);
+    await processPlanIssueActivity(config, issue, workDir);
   } finally {
-    await removeWorktreeActivity(worktreeName);
+    await removeWorktreeActivity(config, worktreeName);
   }
 }
 
 export async function planFeedbackWorkflow(
-  issueComment: IssueComment,
-  baseBranch: string
+  config: RepoConfig,
+  issueComment: IssueComment
 ): Promise<void> {
   const worktreeName = `plan-${issueComment.issueNumber}`;
-  await gitFetchActivity();
+  await gitFetchActivity(config);
   const workDir = await createWorktreeActivity(
+    config,
     worktreeName,
-    `origin/${baseBranch}`,
+    `origin/${config.baseBranch}`,
     undefined
   );
   try {
-    await processPlanFeedbackActivity(issueComment, workDir);
+    await processPlanFeedbackActivity(config, issueComment, workDir);
   } finally {
-    await removeWorktreeActivity(worktreeName);
+    await removeWorktreeActivity(config, worktreeName);
   }
 }
 
 export async function implementIssueWorkflow(
+  config: RepoConfig,
   issue: IssueLike,
-  branch: string,
-  baseBranch: string
+  branch: string
 ): Promise<void> {
   const worktreeName = `issue-${issue.number}`;
-  await gitFetchActivity();
+  await gitFetchActivity(config);
   const workDir = await createWorktreeActivity(
+    config,
     worktreeName,
-    `origin/${baseBranch}`,
+    `origin/${config.baseBranch}`,
     branch
   );
   try {
-    await processIssueActivity(issue, workDir);
+    await processIssueActivity(config, issue, workDir);
   } finally {
-    await removeWorktreeActivity(worktreeName);
+    await removeWorktreeActivity(config, worktreeName);
   }
 }
 
 export async function prFeedbackWorkflow(
-  prComment: PRComment,
-  baseBranch: string
+  config: RepoConfig,
+  prComment: PRComment
 ): Promise<void> {
   const worktreeName = `pr-${prComment.prNumber}`;
-  await gitFetchActivity();
+  await gitFetchActivity(config);
   const workDir = await createWorktreeActivity(
+    config,
     worktreeName,
     `origin/${prComment.prBranch}`,
     prComment.prBranch
   );
   try {
-    await processPRCommentActivity(prComment, workDir);
+    await processPRCommentActivity(config, prComment, workDir);
   } finally {
-    await removeWorktreeActivity(worktreeName);
+    await removeWorktreeActivity(config, worktreeName);
   }
 }
