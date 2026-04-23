@@ -99,14 +99,21 @@ export function loadRepoConfigs(): RepoConfig[] {
       );
     }
     const e = entry as any;
+    const owner = e.owner.trim().replace(/^\/+|\/+$/g, "");
+    const repo = e.repo.trim().replace(/^\/+|\/+$/g, "");
+    if (!owner || !repo) {
+      throw new Error(
+        `Repo config has empty owner or repo after trimming: ${JSON.stringify(entry)}`
+      );
+    }
     if (!path.isAbsolute(e.path)) {
       throw new Error(
-        `Repo "${e.owner}/${e.repo}" path must be absolute: ${e.path}`
+        `Repo "${owner}/${repo}" path must be absolute: ${e.path}`
       );
     }
     configs.push({
-      owner: e.owner,
-      repo: e.repo,
+      owner,
+      repo,
       path: e.path,
       baseBranch: typeof e.baseBranch === "string" ? e.baseBranch : "main",
       token: typeof e.token === "string" ? e.token : undefined,
