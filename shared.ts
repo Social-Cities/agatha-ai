@@ -333,37 +333,13 @@ export async function ensureRepoCloned(ctx: RepoContext): Promise<void> {
     );
   }
 
-  const token = ctx.config.token || DEFAULT_GITHUB_TOKEN;
-  if (!token) {
-    throw new Error(
-      `${ctx.key}: no token available to clone. Set GITHUB_TOKEN or add "token" to the repo config.`
-    );
-  }
-
   const parentDir = path.dirname(repoPath);
   fs.mkdirSync(parentDir, { recursive: true });
 
-  const cloneUrl = `https://x-access-token:${token}@github.com/${ctx.config.owner}/${ctx.config.repo}.git`;
-  const cleanUrl = `https://github.com/${ctx.config.owner}/${ctx.config.repo}.git`;
+  const cloneUrl = `git@github.com:${ctx.config.owner}/${ctx.config.repo}.git`;
 
-  console.log(`Cloning ${ctx.key} into ${repoPath}…`);
-
-  try {
-    await runCommand("git", ["clone", cloneUrl, repoPath], parentDir);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Failed to clone ${ctx.key}: ${message.split(token).join("***")}`
-    );
-  }
-
-  // Strip the embedded token from .git/config so subsequent fetch/push
-  // use the user's existing git credential setup (gh auth, keychain, etc.)
-  await runCommand(
-    "git",
-    ["remote", "set-url", "origin", cleanUrl],
-    repoPath
-  );
+  console.log(`Cloning ${ctx.key} via SSH into ${repoPath}…`);
+  await runCommand("git", ["clone", cloneUrl, repoPath], parentDir);
 }
 
 /* ------------------------------------------------------------------ */
